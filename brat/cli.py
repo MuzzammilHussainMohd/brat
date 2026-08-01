@@ -264,6 +264,52 @@ def build_parser() -> argparse.ArgumentParser:
     p_val = prof_sub.add_parser("validate", parents=[common], help="check profiles are well formed")
     p_val.add_argument("name", nargs="?", help="profile slug or path (default: all)")
 
+    # -- protocol -----------------------------------------------------------
+    p_proto = sub.add_parser(
+        "protocol",
+        parents=[common],
+        help="infer a frame layout from a capture, or decode against a profile",
+        description="A GATT walk sees the pipe, not the frames. Run `impersonate` "
+        "with --session-log to collect frames, `protocol infer` to draft a block "
+        "from them, and `protocol decode` to check the block you wrote.",
+    )
+    proto_sub = p_proto.add_subparsers(dest="protocol_action", metavar="<action>")
+
+    p_infer = proto_sub.add_parser(
+        "infer",
+        parents=[common],
+        help="guess a frame layout from a session log",
+    )
+    p_infer.add_argument(
+        "-s", "--session-log", required=True, help="session log written by impersonate"
+    )
+    p_infer.add_argument(
+        "--name", default="inferred", help="name for the generated protocol block"
+    )
+    p_infer.add_argument(
+        "--min-frames",
+        type=int,
+        default=3,
+        help="frames required before a shared layout is meaningful (default: 3)",
+    )
+    p_infer.add_argument(
+        "--include-tx",
+        action="store_true",
+        help="also analyse frames we sent, not just ones the client wrote",
+    )
+
+    p_dec = proto_sub.add_parser(
+        "decode",
+        parents=[common],
+        help="decode frames against a profile's protocol block",
+    )
+    p_dec.add_argument("-p", "--profile", required=True, help="profile slug or path")
+    p_dec.add_argument("-s", "--session-log", help="session log to decode in full")
+    p_dec.add_argument("hex", nargs="*", help="frame bytes as hex, if not using a log")
+    p_dec.add_argument(
+        "--include-tx", action="store_true", help="also decode frames we sent"
+    )
+
     return parser
 
 
@@ -279,6 +325,7 @@ _MODULES = {
     "impersonate": "impersonate",
     "inject": "inject",
     "profiles": "profiles",
+    "protocol": "protocol",
 }
 
 
@@ -301,6 +348,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "profiles" and not getattr(args, "profile_action", None):
         args.profile_action = "list"
+
+    if args.command == "protocol" and not getattr(args, "protocol_action", None):
+        parser.parse_args([args.command, "--help"])
+        return 2
 
     import importlib
 

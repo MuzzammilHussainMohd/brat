@@ -953,7 +953,88 @@ class RoguePeripheral:
                     continue
                 budget -= width
                 fitted.append(uuid)
+
+        # The Complete Local Name shares the same 31-byte allowance, but BlueZ
+        # carries it in the scan response when it does not fit alongside the
+        # UUIDs - which is why a 13-character name and a 128-bit UUID (36 bytes
+        # together) both make it onto the air. So it is deliberately NOT
+        # charged against the UUID budget above; doing that would drop the very
+        # UUID a client filters on, to fix a problem that does not exist.
+        #
+        # It is worth saying out loud though, because a client that reads only
+        # the advertising packet and never scan-requests will not see the name.
+        name_bytes = len(self.advertised_name.encode("utf-8", "replace"))
+        used = (31 - 3) - budget
+        if fitted and 3 + 2 + name_bytes + used > 31:
+            self._warnings.append(
+                f"advertising: the name {self.advertised_name!r} ({name_bytes}B) and "
+                f"{len(fitted)} service UUID(s) ({used}B) exceed the 31-byte "
+                "advertising packet, so BlueZ will carry the name in the scan "
+                "response. A client that filters on name without scan-requesting "
+                "will not match. Shorten the name, or advertise fewer UUIDs, if "
+                "that turns out to matter."
+            )
+        if name_bytes + 2 > 31:
+            self._warnings.append(
+                f"advertising: the name {self.advertised_name!r} is {name_bytes}B and "
+                "does not fit in a scan response either - it will be truncated, and a "
+                "client matching on the full name will not recognise it."
+            )
         return fitted
+
+    def _manufacturer_data(self) -> dict:
+        """The profile's manufacturer data, marshalled for BlueZ.
+
+        The D-Bus signature is a{qv}, so each value has to be wrapped in a
+        Variant - handing bless bare bytes fails at registration time with an
+        opaque marshalling error rather than anything mentioning this field.
+
+        Also the place where fields the profile declares but bless cannot carry
+        get reported. Silently dropping a declared field is precisely how a
+        clone ends up describing a device it does not actually impersonate.
+        """
+        advertising = self.profile.advertising
+
+        if advertising.appearance is not None:
+            self._warnings.append(
+                f"advertising.appearance ({advertising.appearance}) is declared but "
+                "bless's advertisement exposes no Appearance property, so it will not "
+                "go on the air. A client fingerprinting on appearance will see a "
+                "difference between this and the real device."
+            )
+        if getattr(advertising, "tx_power", None) is not None:
+            self._warnings.append(
+                f"advertising.tx_power ({advertising.tx_power}) is declared but cannot "
+                "be set per-advertisement here; bless sends a fixed value, which most "
+                "controllers ignore."
+            )
+
+        raw = advertising.manufacturer_data or {}
+        if not raw:
+            return {}
+        try:
+            from dbus_next.signature import Variant
+        except ImportError:
+            self._warnings.append(
+                "advertising.manufacturer_data is declared but dbus-next is not "
+                "installed, so it cannot be marshalled - advertising without it."
+            )
+            return {}
+
+        # as_int reads strings as hex, matching how company ids are written
+        # everywhere else (0x004C, or bare 004C), and passes real ints through.
+        from .protocol import as_int, parse_hex
+
+        out = {}
+        for key, value in raw.items():
+            try:
+                out[as_int(key)] = Variant("ay", parse_hex(value))
+            except Exception as exc:  # noqa: BLE001
+                self._warnings.append(
+                    f"advertising.manufacturer_data[{key!r}] is not a company id "
+                    f"mapped to hex bytes ({exc}) - skipping it"
+                )
+        return out
 
     def _apply_advertised_uuids(self) -> None:
         """Force the advertisement to carry the profile's declared UUIDs.
@@ -970,12 +1051,17 @@ class RoguePeripheral:
         the advertised name is correct - the device looks absent rather than
         wrong, which is a difficult failure to attribute.
         """
+        # Computed first, and unconditionally: it is also where fields the
+        # profile declares but bless cannot carry get reported, and those
+        # warnings must not be skipped just because no UUID made it on.
+        mfg = self._manufacturer_data()
+
         fitted = self._fitted_advertised_uuids()
         if not fitted:
             return
 
         app = getattr(self._server, "app", None)
-        if app is None:  # stubbed server in tests
+        if app is None or not hasattr(app, "app_name"):  # stubbed server in tests
             return
 
         # bless constructs the advertisement, appends `services[0].UUID` to it,
@@ -997,6 +1083,8 @@ class RoguePeripheral:
             )
             app.advertisements.append(advertisement)
             advertisement._service_uuids = list(fitted)
+            if mfg:
+                advertisement._manufacturer_data = mfg
 
             app.bus.export(advertisement.path, advertisement)
             iface = adapter.get_interface("org.bluez.LEAdvertisingManager1")
@@ -1021,10 +1109,11 @@ class RoguePeripheral:
             # the exhausted state lives on the controller - but cycling the
             # adapter down and up does. Recover once automatically rather
             # than making the operator diagnose this mid-session.
-            if not self._recover_adapter():
-                raise PeripheralError(self._explain_start_failure(exc)) from exc
+            recovered, detail = self._recover_adapter()
+            if not recovered:
+                raise PeripheralError(self._explain_start_failure(exc, detail)) from exc
             self.console.warn(
-                "advertising registration failed; reset the adapter and retrying"
+                f"advertising registration failed; {detail} and retrying"
             )
             # bless exports the GATT application on the bus and registers it
             # *before* it registers the advertisement, so a failure at the
@@ -1044,6 +1133,32 @@ class RoguePeripheral:
         adapter = getattr(self._server, "adapter", None)
         if app is None:
             return
+
+        # Advertisements first. The patched start_advertising appends to
+        # app.advertisements and exports the object *before* the registration
+        # that failed, so without this the object stays on the bus forever and
+        # the retry creates advertisement2 - bless derives the index from
+        # len(advertisements) + 1. Clearing the list also puts the retry back
+        # at advertisement1. bless's own stop_advertising only pops, never
+        # unexports, so this compensates for that too.
+        for adv in list(getattr(app, "advertisements", [])):
+            if adapter is not None:
+                try:
+                    iface = adapter.get_interface("org.bluez.LEAdvertisingManager1")
+                    await asyncio.wait_for(
+                        iface.call_unregister_advertisement(adv.path), timeout=5.0
+                    )
+                except Exception:  # noqa: BLE001 - it may never have registered
+                    pass
+            try:
+                self._server.bus.unexport(adv.path, adv)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            app.advertisements.clear()
+        except Exception:  # noqa: BLE001
+            pass
+
         if adapter is not None:
             try:
                 await asyncio.wait_for(app.unregister(adapter), timeout=5.0)
@@ -1054,33 +1169,49 @@ class RoguePeripheral:
         except Exception:  # noqa: BLE001
             pass
 
-    def _recover_adapter(self) -> bool:
-        """Cycle the HCI adapter down and up. True if the attempt ran.
+    def _recover_adapter(self) -> tuple[bool, str]:
+        """Cycle the HCI adapter down and up. Returns (ran, detail).
 
         This is the only thing observed to clear the controller-side
         advertising exhaustion described in `start()`; a bluetoothd restart
         leaves it in place.
+
+        The return codes are checked because the previous version reported
+        success whenever `hciconfig` merely *existed*: without root both calls
+        fail silently, and the operator was told the adapter had been reset
+        and the failure retried when neither had happened.
         """
+        import os
         import shutil
         import subprocess
 
         if not shutil.which("hciconfig"):
-            return False
+            return False, "hciconfig is not installed (it is in the bluez package)"
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            return False, "resetting the adapter needs root - re-run under sudo"
+
         adapter = self.adapter or "hci0"
-        try:
-            for action in ("down", "up"):
-                subprocess.run(
+        for action in ("down", "up"):
+            try:
+                proc = subprocess.run(
                     ["hciconfig", adapter, action],
                     capture_output=True,
+                    text=True,
                     timeout=10,
                     check=False,
                 )
-            return True
-        except Exception:  # noqa: BLE001
-            return False
+            except Exception as exc:  # noqa: BLE001
+                return False, f"hciconfig {adapter} {action} could not run: {exc}"
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()
+                return False, (
+                    f"hciconfig {adapter} {action} failed "
+                    f"(exit {proc.returncode}){': ' + detail if detail else ''}"
+                )
+        return True, f"cycled {adapter} down and up"
 
     @staticmethod
-    def _explain_start_failure(exc: Exception) -> str:
+    def _explain_start_failure(exc: Exception, recovery_detail: str = "") -> str:
         """Turn BlueZ's opaque registration errors into an actionable message.
 
         `org.bluez.Error.Failed: Failed to register advertisement` is what
@@ -1094,10 +1225,20 @@ class RoguePeripheral:
         text = str(exc)
         if "advertisement" not in text.lower():
             return text
+        # Say whether the automatic reset actually ran. Without this the
+        # message asserts "resetting the adapter did not clear it" even when
+        # the reset never happened - which sends the operator past the one
+        # step that would have worked.
+        preamble = (
+            f"  The automatic adapter reset did not run: {recovery_detail}.\n"
+            if recovery_detail
+            else "  Resetting the adapter did not clear it.\n"
+        )
         return (
             f"{text}\n"
-            "  BlueZ refused to register the advertisement, and resetting the adapter\n"
-            "  did not clear it. Try, in order:\n"
+            "  BlueZ refused to register the advertisement.\n"
+            f"{preamble}"
+            "  Try, in order:\n"
             "    1. sudo hciconfig <adapter> down && sudo hciconfig <adapter> up\n"
             "       (clears controller-side advertising exhaustion - the usual cause)\n"
             "    2. Check `brat doctor` (ADV SLOTS column) for a leftover advertisement\n"

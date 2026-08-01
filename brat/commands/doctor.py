@@ -103,20 +103,86 @@ async def _bluez_adapters() -> tuple[list[dict], str | None]:
             item = adv_props.get(key)
             return item.value if hasattr(item, "value") else (item or default)
 
+        caps = _av("SupportedCapabilities", {}) or {}
+
+        def _cap(key, default=None):
+            item = caps.get(key)
+            return item.value if hasattr(item, "value") else (item or default)
+
+        name = path.rsplit("/", 1)[-1]
         adapters.append(
             {
                 "path": path,
-                "name": path.rsplit("/", 1)[-1],
+                "name": name,
                 "address": _v("Address", "?"),
+                # What the controller itself reports, read independently of
+                # BlueZ - see controller_address() for why that matters.
+                "controller_address": controller_address(name),
+                "address_type": _v("AddressType", "?"),
+                "manufacturer": _v("Manufacturer", None),
+                "modalias": _v("Modalias", ""),
                 "powered": bool(_v("Powered", False)),
                 "discoverable": bool(_v("Discoverable", False)),
                 "can_advertise": "org.bluez.LEAdvertisingManager1" in ifaces,
                 "can_serve_gatt": "org.bluez.GattManager1" in ifaces,
                 "active_instances": _av("ActiveInstances", 0),
                 "supported_instances": _av("SupportedInstances", 0),
+                "supported_features": list(_av("SupportedFeatures", []) or []),
+                "min_tx_power": _cap("MinTxPower", None),
+                "max_tx_power": _cap("MaxTxPower", None),
+                "max_adv_len": _cap("MaxAdvLen", None),
             }
         )
     return adapters, None
+
+
+# BlueZ reports this as the adapter's Manufacturer for a controller running
+# Zephyr's hci_usb sample - the nRF52840 dongle firmware. See the
+# adapter-firmware check for why that matters for peripheral mode.
+_ZEPHYR_MANUFACTURER = 1521
+_NORDIC_USB_VID = "2fe3"
+
+
+def controller_address(adapter: str) -> str | None:
+    """The BD address the controller itself reports, or None if unreadable.
+
+    Deliberately not BlueZ's `Adapter1.Address`. When a controller boots
+    without an address - which the nRF52840's Zephyr hci_usb firmware does -
+    BlueZ invents a static random one and reports that instead, so its D-Bus
+    view says the adapter is fine while the controller cannot advertise at
+    all. `bluetoothctl show` is not evidence here, and neither is anything
+    else that reads the same property.
+    """
+    import re
+    import shutil
+    import subprocess
+
+    if not shutil.which("hciconfig"):
+        return None
+    try:
+        proc = subprocess.run(
+            ["hciconfig", adapter], capture_output=True, text=True, timeout=5, check=False
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    match = re.search(r"BD Address:\s*([0-9A-Fa-f:]{17})", proc.stdout)
+    return match.group(1).upper() if match else None
+
+
+def _is_zephyr_hci(adapter: dict) -> bool:
+    """Whether this looks like an nRF dongle running Zephyr's hci_usb sample."""
+    if adapter.get("manufacturer") == _ZEPHYR_MANUFACTURER:
+        return True
+    if _NORDIC_USB_VID in str(adapter.get("modalias", "")).lower():
+        return True
+    # Fallback signature for a controller that reports no identity at all:
+    # no advertising features, no TX power range, and no address of its own.
+    return (
+        not adapter.get("supported_features")
+        and adapter.get("min_tx_power") == 0
+        and adapter.get("max_tx_power") == 0
+        and adapter.get("controller_address") == "00:00:00:00:00:00"
+    )
 
 
 async def run_checks() -> tuple[list[Check], list[dict]]:
@@ -303,18 +369,144 @@ async def run_checks() -> tuple[list[Check], list[dict]]:
             )
         )
 
-    # A zeroed address means the controller booted without one - common on
-    # freshly flashed nRF dongles, and it breaks advertising silently.
-    zero_addr = [a for a in adapters if a["address"] in ("00:00:00:00:00:00", "?")]
+    # A controller that booted without an address cannot advertise. BlueZ
+    # hides this: when the controller has none it synthesises a static random
+    # address and reports that through Adapter1.Address, so the old version of
+    # this check - which read that property - could never fire on the very
+    # dongle it was written for, and doctor cheerfully declared impersonate
+    # ready on hardware that provably could not do it.
+    zero_addr = [a for a in adapters if a["controller_address"] == "00:00:00:00:00:00"]
+    unreadable = [a for a in adapters if a["controller_address"] is None]
     if zero_addr:
         checks.append(
             Check(
                 "adapter-address",
                 False,
-                detail=f"{', '.join(a['name'] for a in zero_addr)} has no valid address",
-                fix="Set a static address on the controller before advertising "
-                "(e.g. via btmgmt public-addr, or your dongle's flashing script).",
+                detail="; ".join(
+                    f"{a['name']}: controller reports 00:00:00:00:00:00 "
+                    f"(BlueZ reports {a['address']}, which it invented)"
+                    for a in zero_addr
+                ),
+                fix="The controller booted with no BD address, so it cannot advertise. "
+                "BlueZ synthesises a random static address when this happens, which is "
+                "why `bluetoothctl show` looks fine - it is not evidence. Set an address "
+                "on the controller (btmgmt public-addr, or your dongle's flashing "
+                "script), or use an adapter that has one.",
                 fatal_for=["impersonate", "inject"],
+            )
+        )
+    elif unreadable and adapters:
+        checks.append(
+            Check(
+                "adapter-address",
+                True,
+                detail=f"could not read the controller address for "
+                f"{', '.join(a['name'] for a in unreadable)}",
+                fix="Install bluez's hciconfig so the controller's own address can be "
+                "checked. BlueZ's reported address is not evidence: it invents one when "
+                "the controller has none.",
+            )
+        )
+    elif adapters:
+        checks.append(
+            Check(
+                "adapter-address",
+                True,
+                detail="; ".join(
+                    f"{a['name']} {a['controller_address']}" for a in adapters
+                ),
+            )
+        )
+
+    # The nRF52840 running Zephyr's hci_usb sample presents a working-looking
+    # HCI interface - BlueZ shows Roles: peripheral and both manager
+    # interfaces - while being unable to sustain advertising. It boots with no
+    # BD address, reports no LE advertising features, and leaks advertising
+    # resources across start/stop cycles until the controller answers LE Set
+    # Advertise Enable with "Memory Capacity Exceeded". Restarting bluetoothd
+    # does not clear that: the exhausted state lives on the chip.
+    zephyr = [a for a in adapters if _is_zephyr_hci(a)]
+    if zephyr:
+        checks.append(
+            Check(
+                "adapter-firmware",
+                False,
+                detail="; ".join(
+                    f"{a['name']} is an nRF/Zephyr hci_usb controller" for a in zephyr
+                )
+                + " - detected, but not supported for peripheral mode",
+                fix="Use a generic USB Bluetooth adapter (Intel, Realtek, CSR) for "
+                "impersonate and inject; keep this dongle for sniffing. This firmware "
+                "boots with no BD address, reports no LE advertising features, and "
+                "exhausts its own advertising resources across sessions - a failure a "
+                "bluetoothd restart cannot clear, because it lives on the chip. "
+                "`hciconfig <adapter> down && up` clears it; power-cycling always does.",
+                fatal_for=["impersonate", "inject"],
+            )
+        )
+
+    # The real gate for peripheral mode: an adapter that has the interfaces
+    # *and* can actually use them. `peripheral-mode` above only proves the
+    # interfaces exist, which the Zephyr dongle satisfies while being unusable.
+    usable = [
+        a
+        for a in advertisers
+        if a["powered"]
+        and a["controller_address"] != "00:00:00:00:00:00"
+        and not _is_zephyr_hci(a)
+    ]
+    checks.append(
+        Check(
+            "usable-peripheral-adapter",
+            bool(usable),
+            detail=(
+                ", ".join(f"{a['name']} ({a['controller_address']})" for a in usable)
+                if usable
+                else "no adapter can both advertise and is fit to do so"
+            ),
+            fix="Plug in a generic USB Bluetooth adapter. Every adapter present either "
+            "lacks the BlueZ interfaces, is powered off, has no controller address, or "
+            "runs firmware that cannot sustain advertising."
+            if not usable
+            else "",
+            fatal_for=["impersonate", "inject"] if not usable else [],
+        )
+    )
+
+    # bless resolves its adapter with a literal substring match on "hci0", not
+    # "first available", so a usable adapter that enumerated as hci1 fails with
+    # "No adapter named hci0 found" unless --adapter is passed. Worth one line
+    # here rather than a confusing exception at start-up.
+    if usable and not any(a["name"] == "hci0" for a in usable):
+        first = usable[0]["name"]
+        checks.append(
+            Check(
+                "default-adapter",
+                False,
+                detail=f"the usable adapter is {first}, not hci0",
+                fix=f"Pass --adapter {first} to impersonate and inject. bless looks for "
+                'an adapter whose name contains "hci0" and fails outright otherwise, '
+                "rather than falling back to whatever is available.",
+            )
+        )
+
+    # An empty feature list or a zero TX power range means the controller
+    # cannot honour the advertising hints bless sets unconditionally.
+    featureless = [
+        a
+        for a in advertisers
+        if not a["supported_features"] or a["max_tx_power"] in (0, None)
+    ]
+    if featureless and not zephyr:
+        checks.append(
+            Check(
+                "advertising-features",
+                True,
+                detail="; ".join(
+                    f"{a['name']} reports no LE advertising features" for a in featureless
+                ),
+                fix="Advertising may still work, but TX power and interval hints will "
+                "be ignored or rejected by this controller.",
             )
         )
 
@@ -322,6 +514,19 @@ async def run_checks() -> tuple[list[Check], list[dict]]:
 
 
 COMMANDS = ["scan", "enum", "posture", "clone", "impersonate", "inject"]
+
+
+def _peripheral_verdict(adapter: dict) -> str:
+    """Whether this adapter can be impersonated from, and if not, why not."""
+    if not adapter["can_advertise"] or not adapter["can_serve_gatt"]:
+        return "no (no iface)"
+    if not adapter["powered"]:
+        return "no (off)"
+    if adapter.get("controller_address") == "00:00:00:00:00:00":
+        return "no (no addr)"
+    if _is_zephyr_hci(adapter):
+        return "no (zephyr)"
+    return "yes"
 
 
 def _text(report: Report, console: Console) -> None:
@@ -335,18 +540,23 @@ def _text(report: Report, console: Console) -> None:
 
     if data.get("adapters"):
         console.header("ADAPTERS")
+        # BLUEZ ADDR and CTRL ADDR are shown side by side deliberately: when
+        # they disagree, BlueZ invented one because the controller has none,
+        # and that single fact explains an otherwise baffling inability to
+        # advertise. A rejection reason belongs here, not only in the checks.
         console.table(
-            ["NAME", "ADDRESS", "POWERED", "ADVERTISE", "GATT SERVER", "ADV SLOTS"],
+            ["NAME", "BLUEZ ADDR", "CTRL ADDR", "POWERED", "GATT SERVER", "ADV SLOTS", "PERIPHERAL"],
             [
                 [
                     a["name"],
                     a["address"],
+                    a.get("controller_address") or "unreadable",
                     "yes" if a["powered"] else "no",
-                    "yes" if a["can_advertise"] else "no",
                     "yes" if a["can_serve_gatt"] else "no",
                     f"{a.get('active_instances', 0)}/{a.get('supported_instances', 0)}"
                     if a["can_advertise"]
                     else "-",
+                    _peripheral_verdict(a),
                 ]
                 for a in data["adapters"]
             ],

@@ -1112,3 +1112,133 @@ def test_registration_failure_names_the_characteristic(console, monkeypatch):
 
     assert NUS_RX in str(exc.value)
     assert "notify" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Adapter recovery and advertisement teardown
+# ---------------------------------------------------------------------------
+
+
+def test_recover_adapter_reports_failure_instead_of_claiming_success(peripheral, monkeypatch):
+    """It used to return True whenever hciconfig merely existed, so without
+    root both calls failed silently and the operator was told the adapter had
+    been reset when it had not.
+    """
+    import subprocess
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/hciconfig")
+    monkeypatch.setattr("os.geteuid", lambda: 0)
+
+    class Failed:
+        returncode = 1
+        stdout = ""
+        stderr = "Can't init device hci0: Operation not permitted"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: Failed())
+
+    ok, detail = peripheral._recover_adapter()
+    assert ok is False
+    assert "exit 1" in detail
+    assert "Operation not permitted" in detail
+
+
+def test_recover_adapter_says_when_it_needs_root(peripheral, monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/hciconfig")
+    monkeypatch.setattr("os.geteuid", lambda: 1000)
+
+    ok, detail = peripheral._recover_adapter()
+    assert ok is False
+    assert "root" in detail
+
+
+def test_the_failure_message_says_the_reset_never_ran(peripheral):
+    """Otherwise it asserts "resetting the adapter did not clear it" even when
+    the reset never happened, sending the operator past the step that works.
+    """
+    text = peripheral._explain_start_failure(
+        Exception("Failed to register advertisement"),
+        "resetting the adapter needs root - re-run under sudo",
+    )
+    assert "did not run" in text
+    assert "needs root" in text
+
+
+def test_the_failure_message_still_works_without_a_recovery_detail(peripheral):
+    text = peripheral._explain_start_failure(Exception("Failed to register advertisement"))
+    assert "did not clear it" in text
+
+
+# ---------------------------------------------------------------------------
+# Advertising data
+# ---------------------------------------------------------------------------
+
+
+def _advertising_profile(**advertising):
+    return Profile(
+        slug="adv",
+        name="Adv-Device",
+        advertising=AdvertisingSpec(**advertising),
+        services=[
+            ServiceSpec(
+                uuid=NUS_SERVICE,
+                characteristics=[CharacteristicSpec(uuid=NUS_RX, properties=["notify"])],
+            )
+        ],
+    )
+
+
+def test_manufacturer_data_is_wrapped_in_a_variant(console):
+    """The D-Bus signature is a{qv}; bare bytes fail at registration with a
+    marshalling error that mentions nothing about this field.
+    """
+    from dbus_next.signature import Variant
+
+    profile = _advertising_profile(local_name="A", manufacturer_data={"0x004c": "0215aabb"})
+    rogue = RoguePeripheral(profile=profile, console=console, quiet=True)
+
+    mfg = rogue._manufacturer_data()
+    assert list(mfg) == [0x4C], "company id should be read as hex"
+    assert isinstance(mfg[0x4C], Variant)
+    assert mfg[0x4C].value == bytes.fromhex("0215aabb")
+    assert rogue.warnings == []
+
+
+def test_a_malformed_company_id_is_skipped_with_a_warning_not_a_crash(console):
+    profile = _advertising_profile(local_name="A", manufacturer_data={"nonsense": "00"})
+    rogue = RoguePeripheral(profile=profile, console=console, quiet=True)
+
+    assert rogue._manufacturer_data() == {}
+    assert any("manufacturer_data" in w for w in rogue.warnings)
+
+
+def test_appearance_is_reported_as_undeliverable_rather_than_dropped(console):
+    """bless's advertisement has no Appearance property. Silently ignoring a
+    declared field is how a profile ends up describing a device it does not
+    actually impersonate.
+    """
+    profile = _advertising_profile(local_name="A", appearance=833)
+    rogue = RoguePeripheral(profile=profile, console=console, quiet=True)
+    rogue._manufacturer_data()
+
+    assert any("appearance" in w.lower() for w in rogue.warnings)
+
+
+def test_a_long_name_beside_a_vendor_uuid_warns_about_the_scan_response(console):
+    """13-char name (15B with header) + one 128-bit UUID (18B) + flags (3B)
+    is 36B, over the 31-byte advertising packet. BlueZ moves the name to the
+    scan response rather than failing, so the UUID must NOT be dropped - but
+    a client that never scan-requests will not see the name.
+    """
+    profile = _advertising_profile(local_name="Mira-Analyzer", service_uuids=[NUS_SERVICE])
+    rogue = RoguePeripheral(profile=profile, console=console, quiet=True)
+
+    assert rogue._fitted_advertised_uuids() == [NUS_SERVICE], "the UUID must survive"
+    assert any("scan response" in w for w in rogue.warnings)
+
+
+def test_a_short_name_beside_a_vendor_uuid_warns_about_nothing(console):
+    profile = _advertising_profile(local_name="M", service_uuids=[NUS_SERVICE])
+    rogue = RoguePeripheral(profile=profile, console=console, quiet=True)
+
+    assert rogue._fitted_advertised_uuids() == [NUS_SERVICE]
+    assert rogue.warnings == []

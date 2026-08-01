@@ -185,9 +185,12 @@ protocol:
       # the client echoes it back in a later frame - which is how you confirm
       # the client accepted a value it never should have trusted.
       bind_device: "DEADBEEFCAFE0001"
-      # Firmware version bytes the real analyser reports. A product constant,
-      # not per-unit data.
-      firmware_version: "01070147"
+      # Firmware version bytes the analyser reports. A product constant, not
+      # per-unit data. It has to match what the unit under test is actually
+      # running: the client compares this against its own record, and a
+      # mismatch makes it fall back to asking the user to press the button on
+      # the device, which stalls an otherwise working session.
+      firmware_version: "01070153"
 
     rules:
       # Auth. The client sends its account identifier in the clear and the
@@ -196,6 +199,12 @@ protocol:
       - name: auth
         on_cmd: 0xA3
         description: echo the identifier back as accepted, then confirm the bind
+        # The identifier arrives here but is needed later, in frames triggered
+        # by a different command. Without capturing it, every later response
+        # would have to invent one, and the client discards frames carrying an
+        # identifier it does not recognise.
+        capture:
+          uid: "{req.payload[0:8]}"
         respond:
           - label: A3-ack
             delay: 0.15
@@ -219,6 +228,47 @@ protocol:
             direction: 0x01
             cmd: 0x90
             payload: "{req.payload[19:27]}0E25010001 05{var.firmware_version}{ts:u32be}{req.payload[17:19]}"
+
+      # Data sync. The real analyser pushes this unsolicited once a bind
+      # completes, and the client waits for it before asking for measurements -
+      # so a peripheral that only answers what it is asked never gets past the
+      # bind, and the client eventually gives up and re-authenticates.
+      #
+      # A separate rule from `bind` rather than a second entry in its response
+      # list, because `once` is per-rule and only this frame needs it: a client
+      # that times out restarts the whole handshake, and the bind must still be
+      # acknowledged on the retry while this must not be pushed twice. Delays
+      # accumulate across every response matching a frame, so 0.2 here lands it
+      # 0.2s after the bind ack.
+      #
+      # The payload below is synthetic and structural only. To replay a real
+      # captured frame instead, load it with
+      #   --payload sync=FILE
+      # and reference it as {blob.sync}, slicing around the fields that have to
+      # be patched, e.g. "{sess.uid}{blob.sync[8:]}".
+      - name: data-sync-push
+        on_cmd: 0x90
+        once: true
+        description: unsolicited post-bind data sync, the client's cue to request data
+        respond:
+          - label: 92-sync
+            delay: 0.2
+            direction: 0x01
+            cmd: 0x92
+            payload: "{sess.uid}{var.bind_device}{var.firmware_version}{ts:u32be}{zero:16}"
+
+      # Measurement data. The client asks for this after accepting the sync
+      # above; answering it is what closes the loop and demonstrates that
+      # fabricated readings are accepted from an unauthenticated peripheral.
+      - name: measurement
+        on_cmd: 0x93
+        description: serve fabricated measurement data on request
+        respond:
+          - label: 93-data
+            delay: 0.1
+            direction: 0x01
+            cmd: 0x93
+            payload: "{sess.uid}{var.bind_device}{ts:u32be}{zero:32}"
 
       # Keepalive. Bare acknowledgement; the real device's payload format for
       # this is not documented here, so nothing is invented.

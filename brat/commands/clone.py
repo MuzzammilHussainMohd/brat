@@ -31,12 +31,112 @@ from ..core.profile import (
     DescriptorSpec,
     MatchSpec,
     Profile,
+    ProfileError,
     SecuritySpec,
     ServiceSpec,
+    load_profile,
 )
+from ..core.protocol import ProtocolEngine
+from ..core.peripheral import _UNSERVABLE_PROPERTIES
 from ..core.report import Report
+from ..core.uuids import is_sig
 from ..core.uuids import label as uuid_label
+from ..core.uuids import normalize as norm_uuid
 from ..core.uuids import risk_for, short_form
+
+# BlueZ owns these and refuses to let a GATT server register them, so a profile
+# claiming to advertise one describes a device it can never actually serve.
+_BLUEZ_OWNED = {norm_uuid("1800"), norm_uuid("1801")}
+
+
+def load_protocol_block(source: str) -> dict:
+    """Read a `protocol:` block out of a profile slug or a YAML file.
+
+    A GATT walk can only ever capture the pipe, not the frames going through
+    it, so a fresh clone cannot answer anything. Once the framing for a device
+    family is known, this is what carries it onto the next unit's clone without
+    hand-editing the file.
+    """
+    import yaml
+
+    path = Path(source).expanduser()
+    if path.suffix in (".yaml", ".yml") or path.exists():
+        if not path.exists():
+            raise ProfileError(f"--protocol-from: no such file: {path}")
+        doc = yaml.safe_load(path.read_text()) or {}
+        where = str(path)
+    else:
+        doc = load_profile(source).to_dict()
+        where = f"profile {source!r}"
+
+    block = doc.get("protocol")
+    if not block:
+        raise ProfileError(f"--protocol-from: {where} has no protocol: block")
+
+    # Fail here rather than at impersonate time, where a malformed block
+    # surfaces as the peripheral silently answering nothing.
+    ProtocolEngine(block)
+    return block
+
+
+def _advertisable_uuids(scan_result, services) -> tuple[list[str], list[tuple[str, str]]]:
+    """Decide which service UUIDs the cloned profile should advertise.
+
+    Returns (kept, rejected), where each rejection carries its reason.
+
+    The candidate list cannot be trusted as-is. bleak's `service_uuids` comes
+    from BlueZ's `Device1.UUIDs`, which is a *union* of what the device
+    actually advertised and whatever BlueZ has cached about it from previous
+    connections - including UUIDs discovered while the device was in a
+    completely different mode. Copying that list through verbatim is how a
+    clone ends up advertising a characteristic UUID from a bootloader session,
+    which no client scanning for the device's real service will ever match.
+
+    So the enumerated GATT tree is the authority: a profile may only advertise
+    a service it can actually serve.
+    """
+    served = {
+        norm_uuid(s.uuid)
+        for s in services
+        if norm_uuid(s.uuid) not in _BLUEZ_OWNED
+    }
+    characteristics = {
+        norm_uuid(c.uuid) for s in services for c in s.characteristics
+    }
+
+    kept: list[str] = []
+    rejected: list[tuple[str, str]] = []
+    for raw in (scan_result.service_uuids if scan_result else []):
+        uuid = norm_uuid(raw)
+        if uuid in served:
+            if uuid not in kept:
+                kept.append(uuid)
+        elif uuid in characteristics:
+            rejected.append(
+                (uuid, "it is a characteristic, not a service, so it cannot be advertised")
+            )
+        elif uuid in _BLUEZ_OWNED:
+            rejected.append(
+                (uuid, "BlueZ provides this service itself and will not let us serve it")
+            )
+        else:
+            rejected.append(
+                (
+                    uuid,
+                    "it is not present in the device's GATT tree - probably a stale "
+                    "UUID cached by BlueZ from an earlier connection",
+                )
+            )
+
+    if kept:
+        return kept, rejected
+
+    # Nothing survived, so fall back to the tree. A vendor 128-bit service is
+    # the one a client is most likely to be filtering on; a SIG service like
+    # Battery identifies nothing in particular.
+    vendor = [u for u in sorted(served) if not is_sig(u)]
+    fallback = vendor or sorted(served)
+    return fallback[:1], rejected
 
 # Characteristics whose captured contents are per-unit or personal. Cloning
 # copies them verbatim, so the operator gets told they are in the file.
@@ -154,18 +254,24 @@ async def execute(args, console: Console) -> Report:
         f"{datetime.now(timezone.utc).date().isoformat()}",
     )
 
+    advertisable, rejected_uuids = _advertisable_uuids(scan_result, services)
+
+    protocol_source = getattr(args, "protocol_from", None)
+    if protocol_source:
+        profile.protocol_config = load_protocol_block(protocol_source)
+
     # Match block: prefer service UUIDs over the name - names are trivially
     # spoofed and are frequently truncated in advertising packets.
     profile.match = MatchSpec(
         name=scan_result.name if scan_result and scan_result.name else None,
-        service_uuids=list(scan_result.service_uuids) if scan_result else [],
+        service_uuids=list(advertisable),
     )
     if not profile.match.name and not profile.match.service_uuids:
         profile.match.address = args.address
 
     profile.advertising = AdvertisingSpec(
         local_name=(scan_result.name if scan_result else device_name),
-        service_uuids=list(scan_result.service_uuids) if scan_result else [],
+        service_uuids=list(advertisable),
         manufacturer_data=(
             {k: v.hex() for k, v in scan_result.manufacturer_data.items()}
             if scan_result
@@ -176,6 +282,7 @@ async def execute(args, console: Console) -> Report:
 
     sensitive: list[str] = []
     pii_found: list[str] = []
+    unservable_props: list[str] = []
     captured_values = 0
 
     for service in services:
@@ -187,10 +294,18 @@ async def execute(args, console: Console) -> Report:
         )
 
         for char in service.characteristics:
+            # A property BlueZ has no flag for cannot be served, and leaving it
+            # in the profile makes `brat impersonate` fail at registration with
+            # an error naming neither the characteristic nor the property. The
+            # note keeps the original device's real properties on record.
+            servable, dropped = [], []
+            for prop in char.properties:
+                (dropped if str(prop).lower() in _UNSERVABLE_PROPERTIES else servable).append(prop)
+
             cspec = CharacteristicSpec(
                 uuid=char.uuid,
                 name=uuid_label(char.uuid, "characteristic"),
-                properties=list(char.properties),
+                properties=servable,
                 handle=char.handle,
                 descriptors=[
                     DescriptorSpec(uuid=d["uuid"], name=d["name"])
@@ -204,11 +319,23 @@ async def execute(args, console: Console) -> Report:
                 if short_form(char.uuid) in _PII_CHARS and char.value:
                     pii_found.append(f"{uuid_label(char.uuid, 'characteristic')} ({char.uuid})")
 
+            notes: list[str] = []
             risk = risk_for(char.uuid)
             if risk:
-                cspec.notes = risk.label
+                notes.append(risk.label)
                 if risk.category in ("sensitive-data", "firmware-update", "proprietary-protocol"):
                     sensitive.append(char.uuid)
+            if dropped:
+                notes.append(
+                    f"device also reports {', '.join(dropped)}, which BlueZ cannot "
+                    "serve - omitted from properties so this profile stays servable"
+                )
+                unservable_props.append(
+                    f"{uuid_label(char.uuid, 'characteristic')} ({char.uuid}): "
+                    f"{', '.join(dropped)}"
+                )
+            if notes:
+                cspec.notes = "; ".join(notes)
 
             spec.characteristics.append(cspec)
 
@@ -233,7 +360,12 @@ async def execute(args, console: Console) -> Report:
     # Protocol stub when a transparent serial service is present. It is
     # always emitted as header comments, never as a live `protocol_config` (a
     # clone cannot know the actual frame format from GATT structure alone).
-    protocol_hint = _protocol_hint(profile) if not args.no_protocol_stub else ""
+    # No point scaffolding a protocol block when one was just supplied.
+    protocol_hint = (
+        _protocol_hint(profile)
+        if not args.no_protocol_stub and not profile.protocol_config
+        else ""
+    )
 
     # -- write --------------------------------------------------------------
     out_path = Path(args.output_file) if args.output_file else Path("profiles") / f"{slug}.yaml"
@@ -242,6 +374,21 @@ async def execute(args, console: Console) -> Report:
     if pii_found:
         warnings = "#\n# NOTE: captured values include per-unit identifiers:\n" + "".join(
             f"#   - {p}\n" for p in pii_found
+        )
+    if rejected_uuids:
+        # Recorded in the file itself, not just in the command output: whoever
+        # reads this profile later needs to know a UUID BlueZ reported was
+        # deliberately left out, or the omission looks like a clone bug.
+        warnings += (
+            "#\n# NOTE: BlueZ reported these UUIDs for the device, but they are not\n"
+            "# advertised by this profile:\n"
+            + "".join(f"#   - {u}\n#     {why}\n" for u, why in rejected_uuids)
+        )
+    if unservable_props:
+        warnings += (
+            "#\n# NOTE: properties omitted because a BlueZ GATT server cannot express\n"
+            "# them (the device really does have them):\n"
+            + "".join(f"#   - {p}\n" for p in unservable_props)
         )
 
     header = HEADER_TEMPLATE.format(
@@ -254,9 +401,10 @@ async def execute(args, console: Console) -> Report:
     if protocol_hint:
         header += protocol_hint
 
-    profile.save(out_path, header=header)
-
+    # Validated before saving, so `ready_to_impersonate` describes the file
+    # that was actually written rather than being computed after the fact.
     problems = profile.validate()
+    profile.save(out_path, header=header)
 
     report.data = {
         "address": args.address,
@@ -268,9 +416,35 @@ async def execute(args, console: Console) -> Report:
         "values_captured": captured_values,
         "sensitive_characteristics": profile.security.sensitive_characteristics,
         "identifiers_captured": pii_found,
+        "advertising_uuids": list(profile.advertising.service_uuids),
+        "advertising_uuids_rejected": [
+            {"uuid": u, "reason": why} for u, why in rejected_uuids
+        ],
+        "unservable_properties": unservable_props,
+        "protocol": profile.protocol_config.get("name") if profile.protocol_config else None,
         "validation_problems": problems,
         "ready_to_impersonate": not problems,
     }
+
+    if profile.protocol_config:
+        report.note(
+            f"Protocol block copied from {protocol_source!r}: this clone can answer "
+            "the client, not just log it. Check that the emulation rules match this "
+            "unit - firmware version bytes in particular are often per-release."
+        )
+
+    for uuid, why in rejected_uuids:
+        report.note(
+            f"Not advertising {uuid}: {why}. BlueZ's UUID list for a device mixes "
+            "what it advertised with what was cached from earlier connections, so "
+            "a profile may only advertise services its own GATT tree contains."
+        )
+    if unservable_props:
+        report.note(
+            "Some properties were omitted because a BlueZ GATT server has no flag "
+            "for them; the profile records them in each characteristic's notes. "
+            f"Affected: {'; '.join(unservable_props)}."
+        )
 
     if pii_found:
         report.findings.add(

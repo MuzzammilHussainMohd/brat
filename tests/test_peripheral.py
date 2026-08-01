@@ -60,10 +60,11 @@ def console():
 
 
 def test_property_strings_map_to_bless_flags():
-    flags, unknown = build_properties(
+    flags, unknown, unservable = build_properties(
         ["read", "write", "write-without-response", "notify"],
         GATTCharacteristicProperties,
     )
+    assert unservable == []
     assert unknown == []
     assert flags & GATTCharacteristicProperties.read
     assert flags & GATTCharacteristicProperties.write
@@ -73,15 +74,15 @@ def test_property_strings_map_to_bless_flags():
 
 
 def test_underscore_and_hyphen_spellings_both_accepted():
-    hyphen, _ = build_properties(["write-without-response"], GATTCharacteristicProperties)
-    underscore, _ = build_properties(
+    hyphen, *_ = build_properties(["write-without-response"], GATTCharacteristicProperties)
+    underscore, *_ = build_properties(
         ["write_without_response"], GATTCharacteristicProperties
     )
     assert hyphen == underscore
 
 
 def test_unknown_properties_reported_not_raised():
-    flags, unknown = build_properties(
+    flags, unknown, _ = build_properties(
         ["read", "telepathy"], GATTCharacteristicProperties
     )
     assert unknown == ["telepathy"]
@@ -89,7 +90,7 @@ def test_unknown_properties_reported_not_raised():
 
 
 def test_empty_properties_default_to_readable():
-    flags, _ = build_properties([], GATTCharacteristicProperties)
+    flags, *_ = build_properties([], GATTCharacteristicProperties)
     assert flags & GATTCharacteristicProperties.read
 
 
@@ -1010,3 +1011,104 @@ def test_adapter_is_passed_through_to_the_server(mira, console, monkeypatch):
     rogue = RoguePeripheral(profile=mira, console=console, quiet=True, adapter="hci1")
     asyncio.run(rogue.build())
     assert rogue._server.adapter == "hci1"
+
+
+# ---------------------------------------------------------------------------
+# Properties BlueZ cannot express
+# ---------------------------------------------------------------------------
+
+
+def test_every_mapped_property_survives_blesss_dbus_conversion():
+    """The map must not drift from what bless can actually convert.
+
+    `extended-properties` was in it, and bless's GATTCharacteristicProperties
+    does define the flag - so the lookup succeeded and the failure only
+    appeared later, when bless looked for a matching member in its D-Bus Flags
+    enum, found none, and raised StopIteration from inside a coroutine. That
+    reaches the operator as "RuntimeError: coroutine raised StopIteration",
+    naming neither the characteristic nor the property.
+    """
+    from bless.backends.bluezdbus.characteristic import flags_to_dbus
+
+    from brat.core.peripheral import _PROPERTY_MAP
+
+    for name in _PROPERTY_MAP:
+        flags, unknown, unservable = build_properties(
+            [name], GATTCharacteristicProperties
+        )
+        assert (unknown, unservable) == ([], []), f"{name} is mapped but not usable"
+        flags_to_dbus(flags)  # must not raise
+
+
+def test_extended_properties_is_reported_as_unservable_not_unknown():
+    flags, unknown, unservable = build_properties(
+        ["read", "extended-properties"], GATTCharacteristicProperties
+    )
+    assert unknown == [], "it is a real property - calling it unknown would mislead"
+    assert [p for p, _ in unservable] == ["extended-properties"]
+    assert "0x2900" in unservable[0][1]
+    assert flags & GATTCharacteristicProperties.read
+
+
+def test_a_profile_with_extended_properties_still_builds(console, monkeypatch):
+    """brat clone used to write this straight into profiles, making the
+    resulting profile impossible to serve.
+    """
+    import brat.core.peripheral as mod
+
+    monkeypatch.setattr(
+        mod,
+        "_require_bless",
+        lambda: (FakeServer, GATTCharacteristicProperties, GATTAttributePermissions, GATTDescriptorProperties),
+    )
+    profile = Profile(
+        slug="ext",
+        name="Ext-Device",
+        services=[
+            ServiceSpec(
+                uuid=NUS_SERVICE,
+                characteristics=[
+                    CharacteristicSpec(
+                        uuid=NUS_RX, properties=["read", "notify", "extended-properties"]
+                    )
+                ],
+            )
+        ],
+    )
+    rogue = RoguePeripheral(profile=profile, console=console, quiet=True)
+    asyncio.run(rogue.build())
+
+    assert NUS_RX in rogue._server.chars[NUS_SERVICE]
+    assert any("extended-properties" in w for w in rogue.warnings)
+
+
+def test_registration_failure_names_the_characteristic(console, monkeypatch):
+    """Whatever bless fails on next, the error must say which characteristic."""
+    import brat.core.peripheral as mod
+    from brat.core.peripheral import PeripheralError
+
+    class ExplodingServer(FakeServer):
+        async def add_new_characteristic(self, *a, **k):
+            raise RuntimeError("coroutine raised StopIteration")
+
+    monkeypatch.setattr(
+        mod,
+        "_require_bless",
+        lambda: (ExplodingServer, GATTCharacteristicProperties, GATTAttributePermissions, GATTDescriptorProperties),
+    )
+    profile = Profile(
+        slug="x",
+        name="X",
+        services=[
+            ServiceSpec(
+                uuid=NUS_SERVICE,
+                characteristics=[CharacteristicSpec(uuid=NUS_RX, properties=["notify"])],
+            )
+        ],
+    )
+    rogue = RoguePeripheral(profile=profile, console=console, quiet=True)
+    with pytest.raises(PeripheralError) as exc:
+        asyncio.run(rogue.build())
+
+    assert NUS_RX in str(exc.value)
+    assert "notify" in str(exc.value)

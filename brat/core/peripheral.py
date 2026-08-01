@@ -68,8 +68,6 @@ _PROPERTY_MAP: dict[str, str] = {
     "indicate": "indicate",
     "authenticated-signed-writes": "authenticated_signed_writes",
     "authenticated_signed_writes": "authenticated_signed_writes",
-    "extended-properties": "extended_properties",
-    "extended_properties": "extended_properties",
     "reliable-write": "reliable_write",
     "reliable_write": "reliable_write",
     "writable-auxiliaries": "writable_auxiliaries",
@@ -77,12 +75,44 @@ _PROPERTY_MAP: dict[str, str] = {
 }
 
 
+# Properties a real device can advertise but a BlueZ GATT server cannot
+# express, mapped to why. These are deliberately kept out of _PROPERTY_MAP:
+# bless's GATTCharacteristicProperties *does* define extended_properties, so
+# the lookup succeeds and the failure only surfaces later, when bless converts
+# the flag set for D-Bus and finds no matching member in its Flags enum. That
+# raises StopIteration from inside a coroutine, which Python re-raises as
+# "RuntimeError: coroutine raised StopIteration" - an error naming neither the
+# characteristic nor the property. `brat clone` writes this property straight
+# into profiles, so any cloned device carrying it was unservable.
+_UNSERVABLE_PROPERTIES: dict[str, str] = {
+    "extended-properties": (
+        "BlueZ has no GattCharacteristic1 flag for it - it is implied by the "
+        "Characteristic Extended Properties descriptor (0x2900) instead"
+    ),
+}
+_UNSERVABLE_PROPERTIES["extended_properties"] = _UNSERVABLE_PROPERTIES[
+    "extended-properties"
+]
+
+
 def build_properties(properties: list[str], props_enum) -> Any:
-    """Translate profile property strings into a bless property flag set."""
+    """Translate profile property strings into a bless property flag set.
+
+    Returns (flags, unknown, unservable). `unknown` is a property nobody
+    recognises; `unservable` is one that is perfectly valid on a real device
+    but cannot be served through BlueZ, paired with the reason. Reporting the
+    second as the first would be a lie, and an unhelpful one.
+    """
     flags = None
     unknown: list[str] = []
+    unservable: list[tuple[str, str]] = []
     for name in properties:
-        attr = _PROPERTY_MAP.get(str(name).lower())
+        key = str(name).lower()
+        reason = _UNSERVABLE_PROPERTIES.get(key)
+        if reason is not None:
+            unservable.append((str(name), reason))
+            continue
+        attr = _PROPERTY_MAP.get(key)
         if attr is None:
             unknown.append(name)
             continue
@@ -96,7 +126,7 @@ def build_properties(properties: list[str], props_enum) -> Any:
         # A characteristic with no usable properties is still worth serving as
         # readable so the tree shape matches the original device.
         flags = props_enum.read
-    return flags, unknown
+    return flags, unknown, unservable
 
 
 def build_permissions(char: CharacteristicSpec, perms_enum) -> Any:
@@ -353,10 +383,16 @@ class RoguePeripheral:
             self._served_service_count += 1
 
             for char in service.characteristics:
-                flags, unknown = build_properties(char.properties, props_enum)
+                flags, unknown, unservable = build_properties(char.properties, props_enum)
                 if unknown:
                     self._warnings.append(
                         f"{char.uuid}: ignored unknown properties {', '.join(unknown)}"
+                    )
+                for prop, reason in unservable:
+                    self._warnings.append(
+                        f"{char.uuid}: cannot serve the {prop!r} property - {reason}. "
+                        "The characteristic is served without it; a client that "
+                        "reads properties will see a slightly different device."
                     )
                 perms = build_permissions(char, perms_enum)
 
@@ -372,9 +408,21 @@ class RoguePeripheral:
                 if char.value:
                     self._char_values[char.uuid] = bytes(char.value_bytes)
 
-                await self._server.add_new_characteristic(
-                    service.uuid, char.uuid, flags, None, perms
-                )
+                try:
+                    await self._server.add_new_characteristic(
+                        service.uuid, char.uuid, flags, None, perms
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # bless converts the flag set for D-Bus in here, and a flag
+                    # it cannot express raises from inside a coroutine - which
+                    # Python reports as a bare "RuntimeError: coroutine raised
+                    # StopIteration" naming neither the characteristic nor the
+                    # property. Attribute it before it escapes.
+                    raise PeripheralError(
+                        f"could not register characteristic {char.uuid} "
+                        f"({uuid_label(char.uuid, 'characteristic')}) with properties "
+                        f"{list(char.properties)}: {type(exc).__name__}: {exc}"
+                    ) from exc
                 self._served_characteristic_count += 1
 
                 # Resolve the characteristic object scoped to THIS service

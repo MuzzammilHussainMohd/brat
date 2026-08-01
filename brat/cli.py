@@ -169,6 +169,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="omit the commented protocol scaffold from the generated file",
     )
+    p_clone.add_argument(
+        "--protocol-from",
+        metavar="PROFILE|FILE",
+        help="copy the protocol: block from an existing profile slug or YAML file, "
+        "so the clone can answer the client instead of only logging it",
+    )
 
     # -- impersonate --------------------------------------------------------
     p_imp = sub.add_parser(

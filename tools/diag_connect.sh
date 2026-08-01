@@ -11,8 +11,10 @@
 #   - HCI yes, D-Bus no            -> BlueZ is not surfacing the connection
 #   - D-Bus yes, BRAT no           -> BRAT's connection watch is broken
 #
-# Usage:  sudo bash tools/diag_connect.sh
-# Then connect with nRF Connect when prompted.
+# Usage:  sudo bash tools/diag_connect.sh [SECONDS] [PROFILE] [ADAPTER]
+# Then connect with nRF Connect when prompted. Note that nRF Connect caches
+# stale scan results - rescan, do not tap an entry left over from a previous
+# run, or the connection silently goes nowhere.
 
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -20,10 +22,14 @@ OUT=/tmp/brat_diag
 rm -rf "$OUT"; mkdir -p "$OUT"
 
 WINDOW="${1:-45}"
+PROFILE="${2:-example_wearable}"
+ADAPTER="${3:-}"
+[ -n "$ADAPTER" ] && ADAPTER_ARG="--adapter $ADAPTER" || ADAPTER_ARG=""
+SESSION="$OUT/session.json"
 
 echo "=========================================================="
 echo " BRAT connection diagnostic"
-echo " Window: ${WINDOW}s"
+echo " Window: ${WINDOW}s   Profile: ${PROFILE}   Adapter: ${ADAPTER:-default}"
 echo "=========================================================="
 echo
 
@@ -68,7 +74,8 @@ DBUS_PID=$!
 
 # ── BRAT itself ──────────────────────────────────────────────────────────────
 "$HERE/venv/bin/brat" impersonate \
-    --profile example_wearable --name BRAT-DIAG \
+    --profile "$PROFILE" --name BRAT-DIAG $ADAPTER_ARG \
+    --session-log "$SESSION" \
     --confirm --yes --duration "$WINDOW" > "$OUT/brat.txt" 2>&1 &
 BRAT_PID=$!
 
@@ -83,6 +90,37 @@ wait $BRAT_PID 2>/dev/null
 wait $DBUS_PID 2>/dev/null
 sleep 1
 kill $BTMON_PID 2>/dev/null; wait $BTMON_PID 2>/dev/null
+
+cat > "$OUT/crosscheck.py" <<'CROSSCHECK'
+import json
+import sys
+
+doc = json.load(open(sys.argv[1]))
+hvn = int(sys.argv[2])
+entries = doc.get("entries", [])
+tx = [e for e in entries if e["direction"] == "tx"]
+rx = [e for e in entries if e["direction"] == "rx"]
+delivered = [e for e in tx if e.get("delivered")]
+dropped = [e for e in tx if e.get("delivered") is False]
+
+print(f"  BRAT built      : {len(tx)} outbound frame(s)")
+print(f"  marked delivered: {len(delivered)}")
+print(f"  marked dropped  : {len(dropped)}"
+      + ("  (built, but no central had subscribed)" if dropped else ""))
+print(f"  HCI transmitted : {hvn}")
+print(f"  client wrote    : {len(rx)} frame(s), "
+      f"{sum(1 for e in rx if e.get('frame_ok'))} decoded cleanly")
+
+if dropped and not delivered:
+    print("  >> Everything BRAT sent was dropped by BlueZ: the client never")
+    print("     subscribed. See the CCCD section above - that is the blocker.")
+elif delivered and hvn == 0:
+    print("  >> BRAT believes it sent frames the controller never transmitted.")
+    print("     That is a bless/BlueZ problem, not a profile problem.")
+elif rx and not tx:
+    print("  >> The client wrote to us and got nothing back. Either the profile")
+    print("     has no protocol block, or no rule matches what it sent.")
+CROSSCHECK
 
 # ── Report ───────────────────────────────────────────────────────────────────
 echo "=========================================================="
@@ -109,4 +147,42 @@ grep -E "Central connected|Central disconnected|READ|WRITE|central connected:|fr
      "$OUT/brat.txt" 2>/dev/null | head -20 || echo "  (nothing)"
 
 echo
-echo "Full logs in $OUT/  (hci.txt, dbus.txt, brat.txt)"
+echo
+echo "=========================================================="
+echo " 4. GATT DETAIL - MTU, CCCD, and notifications on the wire"
+echo "=========================================================="
+# The ATT MTU decides whether a long response arrives as one notification or
+# several, and whether a frame can arrive in a single write at all.
+echo "-- ATT MTU --"
+grep -E "Exchange MTU (Request|Response)" -A2 "$OUT/hci.txt" 2>/dev/null \
+     | grep -E "MTU" | head -6 || echo "  (none seen - default 23)"
+
+# A CCCD write is the client saying "start sending me things", and for many
+# devices it is what triggers its first command. Without one, nothing
+# downstream can work and every response we build is discarded by BlueZ.
+echo
+echo "-- Subscription (CCCD) --"
+grep -E "Central subscribed" "$OUT/brat.txt" 2>/dev/null \
+  || echo "  >> BRAT saw no subscription. BlueZ transmits nothing until there is one."
+
+# The only ground truth for "did our response actually leave the controller".
+echo
+echo "-- Notifications transmitted --"
+HVN=$(grep -cE "Handle Value Notification" "$OUT/hci.txt" 2>/dev/null || echo 0)
+echo "  HCI notifications: $HVN"
+
+echo
+echo "=========================================================="
+echo " 5. CROSS-CHECK - what BRAT believes vs what the radio did"
+echo "=========================================================="
+# A mismatch localises the fault immediately.
+if [ -s "$SESSION" ]; then
+    "$HERE/venv/bin/python3" "$OUT/crosscheck.py" "$SESSION" "$HVN"
+else
+    echo "  (no session log - BRAT may not have started; see brat.txt)"
+fi
+
+echo
+echo "Full logs in $OUT/  (hci.txt, dbus.txt, brat.txt, session.json)"
+echo "Draft a protocol block from what the client sent:"
+echo "  brat protocol infer --session-log $SESSION"

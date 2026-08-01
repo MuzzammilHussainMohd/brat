@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brat-ble"
+version = "0.1.0"
+description = "BLE Recon and Attack Toolkit - the peripheral-side half of BLE security testing"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+keywords = ["ble", "bluetooth", "security", "pentest", "gatt", "peripheral", "impersonation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+
+dependencies = [
+    "bleak>=0.22",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# Peripheral-mode commands (clone replay, impersonate, inject) need bless.
+# Kept optional so recon/posture work on a machine that cannot act as a peripheral.
+peripheral = ["bless>=0.3.0"]
+dev = ["pytest>=7.0"]
+all = ["bless>=0.3.0", "pytest>=7.0"]
+
+[project.scripts]
+brat = "brat.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["brat*"]
+
+[tool.setuptools.package-data]
+brat = ["profiles/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

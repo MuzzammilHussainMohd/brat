@@ -1,0 +1,349 @@
+# BRAT — BLE Recon and Attack Toolkit
+
+**Clone a BLE device into a portable profile, then become it.**
+
+Most BLE security tooling plays the central: it connects to a device and asks
+it questions. BRAT does that too, but the reason it exists is the other half —
+standing your machine up *as* the device and recording what talks to it.
+
+```
+brat clone --address AA:BB:CC:DD:EE:FF          # device  -> profiles/mydevice.yaml
+brat impersonate --profile mydevice --confirm   # profile -> a live rogue peripheral
+```
+
+That round trip is the whole idea. Everything else in the toolkit supports it.
+
+---
+
+## Why this exists
+
+The peripheral side of BLE testing is where the tooling ran out. The MITM and
+device-cloning frameworks that security researchers cite — GATTacker, BtleJuice
+— were written around 2016 against Node.js BLE stacks that are no longer
+maintained, and several want two machines to run a single attack. A 2025 survey
+that evaluated BLE tooling against real devices found most of it no longer
+usable. Meanwhile the central-side tools have gotten good.
+
+So BRAT is deliberately not another scanner. It is a maintained, Python,
+profile-driven implementation of the part nobody kept up:
+
+|                          | Central-side tools | BRAT |
+|--------------------------|:------------------:|:----:|
+| Scan / enumerate GATT    | yes                | yes  |
+| Posture and auth checks  | yes                | yes  |
+| **Clone a device to a reusable profile** | no | **yes** |
+| **Advertise and serve as that device**   | no | **yes** |
+| **Decode a vendor protocol from a config file** | no | **yes** |
+| **Inject fabricated data into a client** | no | **yes** |
+
+If you want deep central-side assessment, use a central-side tool —
+Praetorian's [Caeruleus](https://github.com/praetorian-inc/caeruleus) is
+excellent and explicitly scopes itself to the central role. Use BRAT when you
+need to be the peripheral. They compose well.
+
+---
+
+## Install
+
+Linux with BlueZ. Peripheral mode needs an adapter that supports LE
+advertising, which BRAT will verify for you.
+
+```bash
+git clone https://github.com/<you>/brat && cd brat
+pip install -e '.[peripheral]'
+
+brat doctor          # check adapter, BlueZ, and peripheral-mode readiness first
+```
+
+`bleak` and `PyYAML` are the only hard dependencies. `bless` is optional and
+only needed for `impersonate` / `inject`, so recon works on machines that
+cannot act as a peripheral.
+
+---
+
+## The workflow
+
+### 1. Find it
+
+```bash
+$ brat scan
+```
+
+```
+DEVICES (4)
+
+  ADDRESS            NAME            RSSI  ADDR TYPE      SVCS  PROFILE
+  D4:8A:39:11:22:33  Mira-Analyzer   -48   random-static  1     mira_ultra4 +proto
+  C8:1B:2E:00:11:22  Example-Band    -71   resolvable...  2     -
+```
+
+Every result is scored against every known profile, so the output names the
+device instead of leaving you to recognise a MAC. It also classifies the
+address type — a device advertising a non-rotating address can be followed
+around by anyone with a receiver, which is a real finding that most scanners
+never surface.
+
+### 2. Check whether it does its job
+
+```bash
+$ brat posture --address D4:8A:39:11:22:33
+```
+
+One script, no device-specific logic. It connects cold and reports what an
+unauthenticated peer was allowed to do:
+
+```
+VERDICT: connected and read data with no pairing, no authentication, no encryption.
+
+FINDINGS (6)
+
+ CRITICAL  Firmware update interface writable by an unauthenticated peer
+           gatt.dfu-exposed
+ HIGH      Data is transferred over an unencrypted link
+           link.no-encryption
+ ...
+```
+
+Findings are marked **confirmed** (BRAT performed the action and it worked) or
+**inferred** (a property says it would work, but BRAT did not exercise it —
+usually because doing so would write to the device). Tools that blur those two
+produce findings that evaporate under scrutiny. `--probe-writes` converts the
+inferred write findings into confirmed ones, and skips firmware-update
+characteristics while doing it.
+
+Run it against a device you believe is well configured and you should get the
+opposite verdict. That is the point — it is the same script.
+
+### 3. Clone it
+
+```bash
+$ brat clone --address D4:8A:39:11:22:33
+```
+
+Walks the advertising data and the full GATT tree and writes a complete profile.
+No hand-authoring:
+
+```yaml
+device:
+  slug: mira_analyzer
+  name: Mira-Analyzer
+match:
+  name: Mira-Analyzer
+  service_uuids: [6e400001-b5a3-f393-e0a9-e50e24dcca9e]
+gatt:
+  services:
+    - uuid: 6e400001-b5a3-f393-e0a9-e50e24dcca9e
+      name: Nordic UART Service (NUS)
+      characteristics:
+        - uuid: 6e400002-b5a3-f393-e0a9-e50e24dcca9e
+          properties: [write, write-without-response]
+```
+
+A clone copies values verbatim, so it can pick up serial numbers and other
+per-unit identifiers. BRAT tells you when it has, and `--no-values` gives you a
+structure-only clone.
+
+### 4. Become it
+
+```bash
+$ brat impersonate --profile mira_analyzer --confirm
+```
+
+Your machine now advertises that name and serves that GATT tree. Point the real
+client at it and read what it sends:
+
+```
+[+] Advertising as 'Mira-Analyzer'. Waiting for a central to connect.
+
+[+] Central connected (inferred from first GATT operation at 14:22:07.118)
+
+  [14:22:07.412] WRITE -> NUS RX (central writes here)  (25B)
+         0000  A5 00 00 D0 E0 A3 00 0E 49 44 45 4E 54 30 30 31  |........IDENT001|
+         0010  69 C1 B4 B0 01 4A 1F 3C 5A                        |.....J.<Z|
+         CMD=0xA3 (AUTH)  direction=0  length=14  payload=14B
+  [14:22:07.562] NOTIFY <- A3-ack  (20B)
+```
+
+This is also the practical way to learn an undocumented protocol: let the real
+client talk to your clone and read the frames.
+
+---
+
+## The protocol engine
+
+Most custom BLE devices don't use GATT semantically. They open a transparent
+serial pipe — Nordic UART or a vendor equivalent — and push fixed-layout frames
+through it. GATT enumeration sees the pipe; it cannot see the frames.
+
+So a profile can declare the framing as data, and BRAT will decode and generate
+frames for a protocol it has never seen:
+
+```yaml
+protocol:
+  frame:
+    fields:
+      - {name: start,   type: const,  value: "A5"}
+      - {name: cmd,     type: u8}
+      - {name: length,  type: u16be,  length_of: payload}
+      - {name: payload, type: bytes,  length_from: length}
+      - {name: crc,     type: crc}
+      - {name: end,     type: const,  value: "5A"}
+  crc:
+    algorithm: crc16-ibm
+    byte_order: big
+```
+
+Checksums are configured, not coded: `crc16-modbus`, `crc16-ccitt-false`,
+`crc16-xmodem`, `crc16-kermit`, `crc8`, `crc8-maxim`, `crc32`, `sum8`, `xor8`,
+plus per-field overrides for anything unusual. Every preset is verified against
+its published check value in the test suite.
+
+Responses are templates over the request:
+
+```yaml
+  emulation:
+    variables:
+      bind_token: "DEADBEEFCAFE0001"
+    rules:
+      - on_cmd: 0xA3
+        respond:
+          - {cmd: 0xA3, direction: 0x01, payload: "{req.payload[0:8]}01", delay: 0.15}
+          - {cmd: 0xA4, direction: 0x02, delay: 1.2,
+             payload: "{req.payload[0:8]}{var.bind_token}{ts:u32be}"}
+```
+
+| Token | Substitutes |
+|---|---|
+| `{req.payload[a:b]}` | a slice of the request payload |
+| `{req.raw[a:b]}` | a slice of the raw request frame |
+| `{var.NAME}` | a profile variable |
+| `{blob.NAME}` | a file loaded with `--payload NAME=FILE` |
+| `{ts}` / `{ts:u32le}` | current unix time |
+| `{rand:N}` / `{zero:N}` | N random / zero bytes |
+
+Length fields and checksums are computed for you. Writing a working device
+emulator is a config exercise, not a programming one.
+
+---
+
+## Injecting data
+
+```bash
+brat inject --profile mydevice --confirm \
+  --on-cmd 0x93 --inject '02{ts:u32be}{rand:64}'
+```
+
+When the client sends command `0x93`, it gets a correctly-framed, correctly-
+checksummed frame of your content instead of the device's. The profile's normal
+handshake rules still run, so the client reaches the state where the injected
+frame makes sense.
+
+**A limit worth stating plainly:** this proves a client *accepted and parsed*
+fabricated data. It cannot prove what the client then did with it — displayed,
+stored, uploaded. That requires observing the client, which is a separate
+exercise. BRAT's findings are worded to that boundary and say so.
+
+---
+
+## Commands
+
+| Command | Transmits | Does |
+|---|:---:|---|
+| `brat doctor` | no | Adapter, BlueZ, and peripheral-mode readiness |
+| `brat scan` | no | Passive discovery, profile fingerprinting, address typing |
+| `brat enum` | no | Full GATT tree with risk annotations |
+| `brat posture` | no | Security posture check with severity-ranked findings |
+| `brat clone` | no | Device → reusable YAML profile |
+| `brat impersonate` | **yes** | Serve a profile as a rogue peripheral |
+| `brat inject` | **yes** | Serve a profile and feed the client fabricated data |
+| `brat profiles` | no | List, show, and validate profiles |
+
+Every command supports `-o text|json|jsonl`. JSON is canonical and complete;
+the terminal view is a rendering of it, never the other way round. `--fail-at`
+sets the severity that makes the process exit non-zero, for CI use.
+
+---
+
+## Writing your own profile
+
+You usually don't — `brat clone` writes it. When you do, start from
+[`brat/profiles/example_wearable.yaml`](brat/profiles/example_wearable.yaml), which is a
+minimal hand-written template, and check it with:
+
+```bash
+brat profiles validate myprofile
+```
+
+While working out a device's framing, `examples/decode_frame.py` will parse hex
+straight from a sniffer capture or a session log against your draft profile and
+show you what it decoded — and what the profile would reply with:
+
+```bash
+./examples/decode_frame.py myprofile A5 00 00 D0 E0 A3 00 0E ...
+./examples/decode_frame.py myprofile --session-log session.json
+```
+
+Profiles are searched in `$BRAT_PROFILE_PATH`, `./profiles/`,
+`~/.config/brat/profiles/`, then the ones shipped here.
+
+[`brat/profiles/mira_ultra4.yaml`](brat/profiles/mira_ultra4.yaml) is the worked example
+with a complete `protocol:` block, if you want to see what a finished one looks
+like.
+
+---
+
+## Safety and scope
+
+`impersonate` and `inject` put a radio on the air pretending to be a device
+that isn't yours to speak for. They require `--confirm`, and there is no
+environment variable that bypasses it — passing the flag *is* the bypass, and
+it has to be typed. Without it you get a dry run describing exactly what would
+have happened.
+
+- Point BRAT only at hardware you own or have written authorisation to test.
+- A rogue peripheral will accept connections from **any** central in range,
+  including devices belonging to people who did not consent. Consider where you
+  run it.
+- Impersonating a device on a radio you do not control may be unlawful where
+  you are, regardless of intent.
+- Session logs and cloned profiles contain raw bytes from real clients. Treat
+  everything BRAT writes to disk as sensitive, and review it before sharing.
+
+Passive advertising capture (`brat scan`) is a different matter — advertising
+packets are broadcast in the clear by design and listening to them intercepts
+nothing private.
+
+### Included profiles
+
+`brat/profiles/mira_ultra4.yaml` describes a device whose weaknesses were reported
+to the vendor and to regulators, and several are fixed in current production
+firmware. It ships as a worked example of a complete profile — to demonstrate
+the *class* of flaw and what a finished `protocol:` block looks like — not as a
+working attack on shipping hardware. It contains no account identifiers,
+tokens, or measurement data from any real session, and none should be added.
+
+---
+
+## Development
+
+```bash
+pip install -e '.[all]'
+pytest -q
+```
+
+122 tests, no hardware required — the bless server is stubbed, so the peripheral
+engine is testable on a machine with no Bluetooth at all. CRC presets are
+verified against published check values, and the frame codec is verified by
+round-tripping a 237-byte frame recorded off real hardware.
+
+Contributions welcome, especially:
+
+- **Profiles** for devices you own — the more the toolkit ships, the more useful
+  `brat scan` gets for everyone.
+- **Checksum algorithms** and frame field types the codec doesn't cover yet.
+- **Posture checks.** They are small independent functions in
+  `brat/commands/posture.py`; adding one is a local change.
+
+## License
+
+Apache 2.0.

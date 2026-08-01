@@ -1,0 +1,88 @@
+# BRAT device profile - generic wearable (TEMPLATE)
+#
+# A minimal, hand-written profile showing the smallest thing that works. Copy
+# this when you want to write one by hand; run `brat clone` when you have the
+# device in front of you and would rather not.
+#
+# There is no `protocol:` block here, and that is the common case. Plenty of
+# devices only ever use standard SIG characteristics, and a profile without a
+# protocol block still supports scan fingerprinting, posture expectations, and
+# impersonation - `brat impersonate` will serve this tree and log every raw
+# frame a client sends, which is how you work out the framing in the first place.
+
+brat_profile_version: 1
+
+device:
+  slug: example_wearable
+  name: Example Wearable
+  vendor: ""
+  source: hand-written template
+  notes: >
+    Standard heart-rate and battery services over BLE. Replace the UUIDs and
+    values with your own device's, or delete this file and clone the real thing.
+
+# At least one of name / name_regex / service_uuids / address is needed for
+# `brat scan` to fingerprint the device. Prefer service UUIDs - names get
+# truncated in advertising packets and are trivially spoofed.
+match:
+  name: "Example-*"
+  service_uuids:
+    - 0000180d-0000-1000-8000-00805f9b34fb
+
+advertising:
+  local_name: Example-Band
+  service_uuids:
+    - 0000180d-0000-1000-8000-00805f9b34fb
+    - 0000180f-0000-1000-8000-00805f9b34fb
+
+# What the device ought to do. `brat posture` reports the gap between these
+# and what it actually did.
+security:
+  expect_encryption: true
+  expect_pairing: true
+  expect_bonding: false
+  sensitive_characteristics:
+    - 00002a37-0000-1000-8000-00805f9b34fb   # heart rate measurement
+    - 00002a25-0000-1000-8000-00805f9b34fb   # serial number
+
+gatt:
+  services:
+    - uuid: 0000180f-0000-1000-8000-00805f9b34fb
+      name: Battery
+      primary: true
+      characteristics:
+        - uuid: 00002a19-0000-1000-8000-00805f9b34fb
+          name: Battery Level
+          properties: [read, notify]
+          value: "58"                      # 0x58 = 88%
+          descriptors:
+            - uuid: 00002902-0000-1000-8000-00805f9b34fb
+              name: Client Characteristic Configuration
+
+    - uuid: 0000180d-0000-1000-8000-00805f9b34fb
+      name: Heart Rate
+      primary: true
+      characteristics:
+        - uuid: 00002a37-0000-1000-8000-00805f9b34fb
+          name: Heart Rate Measurement
+          properties: [notify]
+          descriptors:
+            - uuid: 00002902-0000-1000-8000-00805f9b34fb
+              name: Client Characteristic Configuration
+        - uuid: 00002a38-0000-1000-8000-00805f9b34fb
+          name: Body Sensor Location
+          properties: [read]
+          value: "02"                      # 0x02 = wrist
+
+    - uuid: 0000180a-0000-1000-8000-00805f9b34fb
+      name: Device Information
+      primary: true
+      characteristics:
+        - uuid: 00002a29-0000-1000-8000-00805f9b34fb
+          name: Manufacturer Name String
+          properties: [read]
+          value: 4578616d706c6520436f2e      # "Example Co."
+        - uuid: 00002a26-0000-1000-8000-00805f9b34fb
+          name: Firmware Revision String
+          properties: [read]
+          value: "312e322e33"               # "1.2.3"

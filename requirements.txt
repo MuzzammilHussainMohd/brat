@@ -1,0 +1,7 @@
+# Core - recon, posture, clone (capture side)
+bleak>=0.22
+PyYAML>=6.0
+
+# Peripheral mode - impersonate, inject, clone replay
+# Linux/BlueZ only. Install with: pip install -r requirements.txt
+bless>=0.3.0

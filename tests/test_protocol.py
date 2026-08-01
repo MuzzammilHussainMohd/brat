@@ -492,3 +492,132 @@ def test_req_name_token_falls_back_to_minimal_width_without_field_widths():
     request = engine.decode(engine.codec.build({"cmd": 0x92, "payload": b"\x01"}))
     rendered = render_template("{req.length}", TemplateContext(request=request))
     assert rendered == b"\x01"
+
+
+# ---------------------------------------------------------------------------
+# Cross-frame session state
+#
+# A real handshake routinely needs a value from an *earlier* frame - an
+# identifier sent during authentication that has to reappear in a later data
+# frame. Before `capture:` the only expressible responses were ones derivable
+# from the frame that triggered them.
+# ---------------------------------------------------------------------------
+
+
+def _emulation(rules, variables=None):
+    cfg = dict(FRAME_CONFIG)
+    cfg["emulation"] = {"variables": variables or {}, "rules": rules}
+    return ProtocolEngine(cfg)
+
+
+def test_capture_makes_a_value_available_to_a_later_rule():
+    eng = _emulation(
+        [
+            {"name": "auth", "on_cmd": 0xA3, "capture": {"uid": "{req.payload[0:8]}"}},
+            {
+                "name": "sync",
+                "on_cmd": 0x92,
+                "respond": [{"cmd": 0x92, "payload": "{sess.uid}FF"}],
+            },
+        ]
+    )
+    eng.responses_for(eng.decode(eng.codec.build({"cmd": 0xA3, "payload": b"IDENT001x"})))
+    assert eng.session["uid"] == b"IDENT001"
+
+    _, data, _ = eng.responses_for(eng.decode(eng.codec.build({"cmd": 0x92, "payload": b""})))[0]
+    assert b"IDENT001\xff" in data
+
+
+def test_a_rule_can_use_what_it_just_captured():
+    eng = _emulation(
+        [
+            {
+                "name": "auth",
+                "on_cmd": 0xA3,
+                "capture": {"uid": "{req.payload[0:8]}"},
+                "respond": [{"cmd": 0xA3, "payload": "{sess.uid}01"}],
+            }
+        ]
+    )
+    _, data, _ = eng.responses_for(
+        eng.decode(eng.codec.build({"cmd": 0xA3, "payload": b"IDENT001"}))
+    )[0]
+    assert b"IDENT001\x01" in data
+
+
+def test_reading_an_uncaptured_value_names_the_capture_clause():
+    eng = _emulation(
+        [{"name": "sync", "on_cmd": 0x92, "respond": [{"cmd": 0x92, "payload": "{sess.uid}"}]}]
+    )
+    with pytest.raises(ProtocolError, match="capture:"):
+        eng.responses_for(eng.decode(eng.codec.build({"cmd": 0x92, "payload": b""})))
+
+
+def test_reset_session_clears_captures_between_connections():
+    """Otherwise the second client to connect is answered with the first
+    client's identifiers.
+    """
+    eng = _emulation(
+        [{"name": "auth", "on_cmd": 0xA3, "capture": {"uid": "{req.payload[0:8]}"}}]
+    )
+    eng.responses_for(eng.decode(eng.codec.build({"cmd": 0xA3, "payload": b"IDENT001"})))
+    assert eng.session
+    eng.reset_session()
+    assert eng.session == {}
+
+
+def test_once_rule_fires_only_once_per_connection():
+    """Clients that time out restart the handshake; a rule that pushes
+    unsolicited data must not push it twice.
+    """
+    eng = _emulation(
+        [{"name": "push", "on_cmd": 0x90, "once": True, "respond": [{"cmd": 0x92}]}]
+    )
+    frame = eng.decode(eng.codec.build({"cmd": 0x90, "payload": b""}))
+    assert len(eng.responses_for(frame)) == 1
+    assert eng.responses_for(frame) == []
+    eng.reset_session()
+    assert len(eng.responses_for(frame)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Slicing beyond req.*
+# ---------------------------------------------------------------------------
+
+
+def test_blob_and_var_tokens_can_be_sliced():
+    """A captured replay blob nearly always needs fields patched around, so
+    using one at all means slicing it.
+    """
+    eng = _emulation(
+        [{"name": "r", "on_cmd": 0x92, "respond": [{"cmd": 0x92, "payload": "{blob.b[1:4]}{var.v[0:2]}"}]}],
+        variables={"v": "DEADBEEF"},
+    )
+    _, data, _ = eng.responses_for(
+        eng.decode(eng.codec.build({"cmd": 0x92, "payload": b""})),
+        blobs={"b": bytes.fromhex("00112233445566")},
+    )[0]
+    assert b"\x11\x22\x33\xde\xad" in data
+
+
+def test_unsliced_var_and_blob_tokens_still_work():
+    eng = _emulation(
+        [{"name": "r", "on_cmd": 0x92, "respond": [{"cmd": 0x92, "payload": "{var.v}{blob.b}"}]}],
+        variables={"v": "AABB"},
+    )
+    _, data, _ = eng.responses_for(
+        eng.decode(eng.codec.build({"cmd": 0x92, "payload": b""})),
+        blobs={"b": b"\xcc"},
+    )[0]
+    assert b"\xaa\xbb\xcc" in data
+
+
+def test_out_of_range_slice_is_an_error_not_a_short_field():
+    """Python would clamp silently, building a malformed frame that looks like
+    the device answered with nonsense.
+    """
+    eng = _emulation(
+        [{"name": "r", "on_cmd": 0xA3, "respond": [{"cmd": 0xA3, "payload": "{req.payload[0:99]}"}]}]
+    )
+    with pytest.raises(ProtocolError, match="do not exist"):
+        eng.responses_for(eng.decode(eng.codec.build({"cmd": 0xA3, "payload": b"short"})))

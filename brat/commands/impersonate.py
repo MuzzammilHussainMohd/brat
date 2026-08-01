@@ -43,7 +43,6 @@ async def execute(args, console: Console) -> Report:
     profile = load_profile(args.profile)
     report = Report(command="impersonate", target=profile.slug)
 
-    name = args.name or profile.advertising.local_name or profile.name
     blobs = load_blobs(getattr(args, "payload", None))
 
     problems = profile.validate()
@@ -52,6 +51,19 @@ async def execute(args, console: Console) -> Report:
         for p in problems:
             console.bullet(p, indent=4)
         console.write()
+
+    # Built before the confirmation prompt (construction does no I/O) so the
+    # name quoted in the prompt is the one the radio will actually broadcast,
+    # rather than a second, separately-computed guess at it.
+    peripheral = RoguePeripheral(
+        profile=profile,
+        console=console,
+        name_override=args.name,
+        blobs=blobs,
+        quiet=args.output != "text",
+        adapter=args.adapter,
+    )
+    name = peripheral.advertised_name
 
     if not require_confirm(
         console,
@@ -76,15 +88,6 @@ async def execute(args, console: Console) -> Report:
     ):
         report.data = {"confirmed": False, "profile": profile.slug}
         return report
-
-    peripheral = RoguePeripheral(
-        profile=profile,
-        console=console,
-        name_override=args.name,
-        blobs=blobs,
-        quiet=args.output != "text",
-        adapter=args.adapter,
-    )
 
     console.header("ROGUE PERIPHERAL")
     console.kv("profile", f"{profile.name} ({profile.slug})")
@@ -138,6 +141,13 @@ async def execute(args, console: Console) -> Report:
 
 
 def _add_findings(report: Report, peripheral: RoguePeripheral, profile) -> None:
+    for err in peripheral.errors:
+        report.note(
+            "A response failed to build or send, so this session is incomplete "
+            "and any absence of client activity below may be our fault rather "
+            f"than the client's:\n{err}"
+        )
+
     if not peripheral.connected:
         report.note(
             "No central connected during this session, so nothing was demonstrated. "
@@ -237,6 +247,22 @@ def _add_findings(report: Report, peripheral: RoguePeripheral, profile) -> None:
     # plain GATT read reply (`origin == "read-reply"`) is not a protocol
     # response and must not inflate this finding.
     protocol_tx = [e for e in peripheral.log.tx if e.origin == "protocol-response"]
+
+    # A notification BlueZ never transmitted, because no central had written
+    # the CCCD, is not evidence of anything the client did. `update_value()`
+    # cannot distinguish the two, so `delivered` is the only honest filter.
+    undelivered = [e for e in protocol_tx if e.delivered is False]
+    if undelivered and len(undelivered) == len(protocol_tx):
+        report.note(
+            f"All {len(protocol_tx)} protocol response(s) were built but never "
+            "transmitted - no central had subscribed to the notify characteristic, "
+            "so BlueZ dropped them. No claim can be made about how the client "
+            "treats our responses until it subscribes."
+        )
+        protocol_tx = []
+    else:
+        protocol_tx = [e for e in protocol_tx if e.delivered is not False]
+
     if protocol_tx and profile.protocol_config:
         report.findings.add(
             Finding(

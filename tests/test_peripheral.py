@@ -22,12 +22,17 @@ from brat.core.peripheral import (
 from brat.core.profile import (
     AdvertisingSpec,
     CharacteristicSpec,
+    MatchSpec,
     Profile,
     ServiceSpec,
     load_profile,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+NUS_TX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"   # central writes here
+NUS_RX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"   # peripheral notifies here
 
 pytest.importorskip("bless", reason="peripheral mode requires bless")
 
@@ -143,15 +148,32 @@ class FakeService:
         return self._chars.get(uuid)
 
 
+class FakeApp:
+    """Stand-in for bless's BlueZGattApplication.
+
+    Only `subscribed_characteristics` matters here: it is where bless records
+    CCCD writes, and therefore the only way to know whether a notification
+    would actually be transmitted.
+    """
+
+    def __init__(self):
+        self.subscribed_characteristics = []
+
+
 class FakeServer:
     """Minimal stand-in for BlessServer."""
 
-    def __init__(self, name):
+    # `adapter` is accepted because the real BlessServer takes it as a kwarg
+    # and RoguePeripheral.build() passes it whenever --adapter was given. A
+    # stub without it silently forces every test down the no-adapter path.
+    def __init__(self, name, adapter=None):
         self.name = name
+        self.adapter = adapter
         self.chars = {}
         self.updates = []
         self.descriptors = []
         self.started = False
+        self.app = FakeApp()
 
     async def add_new_service(self, uuid):
         self.chars.setdefault(uuid, {})
@@ -791,3 +813,200 @@ def test_run_until_interrupt_removes_its_signal_handlers(peripheral, console):
             assert loop.remove_signal_handler(sig) is False
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Response-path failures must be visible
+#
+# These pin the defect that made every other bug in this file hard to find:
+# the response coroutine's Future was discarded, so a broken emulation rule
+# produced no output, no traceback, and no finding - indistinguishable from a
+# client that simply never said anything.
+# ---------------------------------------------------------------------------
+
+
+def _a3_frame(mira):
+    return mira.protocol.codec.build({"cmd": 0xA3, "payload": b"IDENT001" + b"\x00" * 6})
+
+
+def test_response_exception_is_reported_not_swallowed(mira, monkeypatch):
+    import io
+
+    import brat.core.peripheral as mod
+
+    monkeypatch.setattr(
+        mod,
+        "_require_bless",
+        lambda: (FakeServer, GATTCharacteristicProperties, GATTAttributePermissions, GATTDescriptorProperties),
+    )
+    # An explicit stream rather than capsys/capfd: Console binds its stream at
+    # construction, so what it writes to is decided before pytest's capture
+    # fixtures are in play.
+    stream = io.StringIO()
+    peripheral = RoguePeripheral(
+        profile=mira,
+        console=Console(stream=stream, force_color=False),
+        quiet=True,
+    )
+    asyncio.run(peripheral.build())
+
+    def boom(*a, **k):
+        raise RuntimeError("template exploded")
+
+    peripheral.profile.protocol.responses_for = boom
+
+    async def scenario():
+        peripheral._loop = asyncio.get_running_loop()
+        peripheral._on_write(FakeCharacteristic(NUS_TX), _a3_frame(mira))
+        await asyncio.sleep(0.05)
+
+    asyncio.run(scenario())
+
+    assert peripheral.errors, "a failing response rule recorded no error"
+    assert "template exploded" in peripheral.errors[0]
+    assert "RuntimeError" in peripheral.errors[0]
+    # Reported to the operator too, not just stashed on the object - and
+    # reported even though the peripheral is quiet, since suppressing an error
+    # because the operator asked for JSON is the exact failure being fixed.
+    assert "template exploded" in stream.getvalue()
+
+
+def test_response_errors_reach_the_session_summary(peripheral, mira):
+    asyncio.run(peripheral.build())
+    peripheral.profile.protocol.responses_for = lambda *a, **k: 1 / 0
+
+    async def scenario():
+        peripheral._loop = asyncio.get_running_loop()
+        peripheral._on_write(FakeCharacteristic(NUS_TX), _a3_frame(mira))
+        await asyncio.sleep(0.05)
+
+    asyncio.run(scenario())
+    assert any("ZeroDivisionError" in e for e in peripheral.summary()["errors"])
+
+
+def test_pending_responses_are_drained_on_stop(peripheral, mira):
+    """A rule that staggers frames must not be cut off by teardown.
+
+    The Mira profile's A4 confirm is 1.2s behind its A3 ack; stopping without
+    draining loses it and the session reads as though the client was ignored.
+    """
+    asyncio.run(peripheral.build())
+    sent = []
+
+    async def slow(frame, uuid=None):
+        await asyncio.sleep(0.2)
+        sent.append("late")
+
+    peripheral._respond = slow
+
+    async def scenario():
+        peripheral._loop = asyncio.get_running_loop()
+        peripheral._on_write(FakeCharacteristic(NUS_TX), _a3_frame(mira))
+        assert peripheral._pending, "the response was not tracked"
+        await peripheral.stop()
+
+    asyncio.run(scenario())
+    assert sent == ["late"], "stop() cut off an in-flight response"
+
+
+# ---------------------------------------------------------------------------
+# Notification delivery
+# ---------------------------------------------------------------------------
+
+
+def test_notify_is_marked_undelivered_when_nobody_subscribed(peripheral):
+    """bless's update_value() returns True whether or not anyone is listening,
+    so without the CCCD check a log of unheard notifications looks identical
+    to one the client received.
+    """
+    asyncio.run(peripheral.build())
+    asyncio.run(peripheral.notify(b"\x01\x02", uuid=NUS_RX, label="test"))
+
+    entry = peripheral.log.tx[-1]
+    assert entry.delivered is False
+    assert entry.to_dict()["delivered"] is False
+
+
+def test_notify_is_marked_delivered_once_a_central_subscribes(peripheral):
+    asyncio.run(peripheral.build())
+    peripheral._server.app.subscribed_characteristics.append(NUS_RX)
+    asyncio.run(peripheral.notify(b"\x01\x02", uuid=NUS_RX, label="test"))
+
+    assert peripheral.log.tx[-1].delivered is True
+
+
+def test_delivery_is_unknown_when_the_server_exposes_no_app(peripheral):
+    """Never claim a notification was dropped just because we cannot tell."""
+    asyncio.run(peripheral.build())
+    peripheral._server.app = None
+    asyncio.run(peripheral.notify(b"\x01", uuid=NUS_RX, label="test"))
+
+    assert peripheral.log.tx[-1].delivered is None
+
+
+# ---------------------------------------------------------------------------
+# Advertised name
+# ---------------------------------------------------------------------------
+
+
+def _profile_named(match_name, local_name=None, device_name="Device"):
+    return Profile(
+        slug="p",
+        name=device_name,
+        match=MatchSpec(name=match_name),
+        advertising=AdvertisingSpec(local_name=local_name),
+        services=[
+            ServiceSpec(
+                uuid="6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+                characteristics=[
+                    CharacteristicSpec(uuid=NUS_RX, properties=["notify"])
+                ],
+            )
+        ],
+    )
+
+
+def test_match_name_glob_never_becomes_the_advertised_name(console):
+    """match.name is an fnmatch pattern for *finding* a device. Broadcasting
+    it would put a literal "Mira-*" on the air.
+    """
+    profile = _profile_named("Mira-*", device_name="Mira Ultra4")
+    rogue = RoguePeripheral(profile=profile, console=console, quiet=True)
+    assert rogue.advertised_name == "Mira Ultra4"
+
+
+def test_advertising_local_name_wins_over_the_device_name(console):
+    profile = _profile_named("Mira-*", local_name="Mira-Analyzer", device_name="Mira Ultra4")
+    rogue = RoguePeripheral(profile=profile, console=console, quiet=True)
+    assert rogue.advertised_name == "Mira-Analyzer"
+
+
+def test_a_name_with_no_usable_characters_is_refused(console):
+    """bless builds its D-Bus object path by stripping the name to
+    [A-Za-z0-9_]; a name that strips to nothing yields "/org/bluez//..." and
+    an error that points nowhere near the profile.
+    """
+    from brat.core.peripheral import PeripheralError
+
+    profile = _profile_named("*", device_name="***")
+    with pytest.raises(PeripheralError, match="D-Bus object path"):
+        RoguePeripheral(profile=profile, console=console, quiet=True)
+
+
+def test_a_glob_looking_name_warns(console):
+    profile = _profile_named("x", local_name="Mira-*", device_name="d")
+    rogue = RoguePeripheral(profile=profile, console=console, quiet=True)
+    assert any("looks like a glob" in w for w in rogue.warnings)
+
+
+def test_adapter_is_passed_through_to_the_server(mira, console, monkeypatch):
+    import brat.core.peripheral as mod
+
+    monkeypatch.setattr(
+        mod,
+        "_require_bless",
+        lambda: (FakeServer, GATTCharacteristicProperties, GATTAttributePermissions, GATTDescriptorProperties),
+    )
+    rogue = RoguePeripheral(profile=mira, console=console, quiet=True, adapter="hci1")
+    asyncio.run(rogue.build())
+    assert rogue._server.adapter == "hci1"

@@ -416,7 +416,13 @@ class FrameCodec:
 # ---------------------------------------------------------------------------
 
 _TOKEN_RE = re.compile(r"\{([^}]+)\}")
-_SLICE_RE = re.compile(r"^(?P<src>req\.(?:payload|raw))(?:\[(?P<a>-?\d*):(?P<b>-?\d*)\])?$")
+# Sliceable sources. `var`, `blob` and `sess` are here as well as `req` because
+# a captured replay blob almost always needs a few fields patched, which means
+# slicing around them - without it the only way to use a blob is verbatim.
+_SLICE_RE = re.compile(
+    r"^(?P<src>req\.(?:payload|raw)|(?:blob|var|sess)\.[A-Za-z0-9_]+)"
+    r"(?:\[(?P<a>-?\d*):(?P<b>-?\d*)\])?$"
+)
 
 
 @dataclass
@@ -426,6 +432,13 @@ class TemplateContext:
     request: Frame | None = None
     variables: dict[str, bytes] = field(default_factory=dict)
     blobs: dict[str, bytes] = field(default_factory=dict)
+    # Values captured from *earlier* frames in this connection, via a rule's
+    # `capture:` clause. `request` only ever holds the frame that triggered
+    # the current rule, but real handshakes routinely need a value from a
+    # previous one - an identifier sent during authentication that has to
+    # appear in a later data frame, say. Without this the only expressible
+    # responses are ones derivable from the triggering frame alone.
+    session: dict[str, bytes] = field(default_factory=dict)
     # Declared byte width for each int-typed frame field, e.g. {"length": 2}
     # for a u16be field. Lets {req.NAME} emit the field's real width instead
     # of the minimal width needed to hold its current value - without this,
@@ -444,9 +457,13 @@ def render_template(template: str | bytes | None, ctx: TemplateContext) -> bytes
       {req.raw[2:3]}         a slice of the raw request frame
       {var.NAME}             a profile variable (hex)
       {blob.NAME}            a loaded binary blob (e.g. --payload file)
+      {sess.NAME}            a value captured from an earlier frame
       {ts}  {ts:u32le}       current unix time, u32be by default
       {rand:N}               N random bytes
       {zero:N}               N zero bytes
+
+    `req.payload`, `req.raw`, `var.`, `blob.` and `sess.` all accept a
+    `[a:b]` slice suffix.
     """
     if template is None:
         return b""
@@ -464,36 +481,69 @@ def render_template(template: str | bytes | None, ctx: TemplateContext) -> bytes
     return bytes(out)
 
 
-def _resolve_token(token: str, ctx: TemplateContext) -> bytes:
-    slice_match = _SLICE_RE.match(token)
-    if slice_match:
+def _resolve_source(src: str, token: str, ctx: TemplateContext) -> bytes:
+    """The bytes a sliceable token refers to, before any slice is applied."""
+    kind, _, name = src.partition(".")
+
+    if kind == "req":
         if ctx.request is None:
             raise ProtocolError(f"token {{{token}}} used with no request in context")
-        source = (
-            ctx.request.payload
-            if slice_match.group("src") == "req.payload"
-            else ctx.request.raw
-        )
-        a_txt, b_txt = slice_match.group("a"), slice_match.group("b")
-        if a_txt is None and b_txt is None:
-            return bytes(source)
-        a = int(a_txt) if a_txt else 0
-        b = int(b_txt) if b_txt else len(source)
-        return bytes(source[a:b])
+        return bytes(ctx.request.payload if name == "payload" else ctx.request.raw)
 
-    if token.startswith("var."):
-        name = token[4:]
+    if kind == "var":
         if name not in ctx.variables:
             raise ProtocolError(f"undefined profile variable {name!r}")
         return ctx.variables[name]
 
-    if token.startswith("blob."):
-        name = token[5:]
+    if kind == "blob":
         if name not in ctx.blobs:
             raise ProtocolError(
                 f"blob {name!r} not loaded - supply it with --payload {name}=FILE"
             )
         return ctx.blobs[name]
+
+    if kind == "sess":
+        if name not in ctx.session:
+            raise ProtocolError(
+                f"nothing captured under {name!r} yet. {{sess.{name}}} reads a value "
+                "saved by an earlier rule's `capture:` clause, so a rule that runs "
+                "before that one has nothing to read. Check that the capturing rule "
+                "matches a frame the client actually sends first."
+            )
+        return ctx.session[name]
+
+    raise ProtocolError(f"unknown template token {{{token}}}")
+
+
+def _apply_slice(source: bytes, a_txt: str | None, b_txt: str | None, token: str) -> bytes:
+    if a_txt is None and b_txt is None:
+        return source
+    n = len(source)
+    a = int(a_txt) if a_txt else 0
+    b = int(b_txt) if b_txt else n
+    if a < 0:
+        a += n
+    if b < 0:
+        b += n
+    # Python clamps an out-of-range slice silently, which here would build a
+    # short field and therefore a malformed frame - and the client would look
+    # like it rejected a well-formed response. A template asking for bytes the
+    # source does not have is a profile bug; say so.
+    if not (0 <= a <= b <= n):
+        raise ProtocolError(
+            f"token {{{token}}} slices [{a}:{b}] of a {n}-byte source; "
+            "the response would be built from bytes that do not exist"
+        )
+    return source[a:b]
+
+
+def _resolve_token(token: str, ctx: TemplateContext) -> bytes:
+    slice_match = _SLICE_RE.match(token)
+    if slice_match:
+        source = _resolve_source(slice_match.group("src"), token, ctx)
+        return _apply_slice(
+            source, slice_match.group("a"), slice_match.group("b"), token
+        )
 
     if token == "ts" or token.startswith("ts:"):
         kind = token.split(":", 1)[1] if ":" in token else "u32be"
@@ -559,6 +609,13 @@ class EmulationRule:
     on_any: bool = False
     responses: list[ResponseSpec] = field(default_factory=list)
     description: str = ""
+    # {name: template} evaluated against the matching frame and stored in the
+    # engine's session, for a later rule to read back as {sess.name}.
+    capture: dict[str, str] = field(default_factory=dict)
+    # Fire at most once per connection. Clients that time out often restart
+    # the whole handshake, and a rule that pushes unsolicited data (rather
+    # than acknowledging something) must not push it twice.
+    once: bool = False
 
     @classmethod
     def from_dict(cls, d: dict) -> "EmulationRule":
@@ -569,6 +626,8 @@ class EmulationRule:
             on_any=bool(d.get("on_any", False)),
             responses=[ResponseSpec.from_dict(r) for r in d.get("respond", [])],
             description=str(d.get("description", "")),
+            capture={str(k): str(v) for k, v in (d.get("capture") or {}).items()},
+            once=bool(d.get("once", False)),
         )
 
     def matches(self, frame: Frame) -> bool:
@@ -621,6 +680,18 @@ class ProtocolEngine:
         }
         self.rules = [EmulationRule.from_dict(r) for r in (emulation.get("rules") or [])]
 
+        # Per-connection state: values captured by `capture:` clauses, and the
+        # names of `once:` rules that have already fired. Both must be cleared
+        # between centrals, or the second client to connect gets responses
+        # built from the first client's identifiers.
+        self.session: dict[str, bytes] = {}
+        self._fired: set[str] = set()
+
+    def reset_session(self) -> None:
+        """Forget everything captured from the connection that just ended."""
+        self.session.clear()
+        self._fired.clear()
+
     # -- decode -------------------------------------------------------------
 
     def decode(self, data: bytes) -> Frame | None:
@@ -661,11 +732,20 @@ class ProtocolEngine:
             variables=self.variables,
             blobs=blobs or {},
             field_widths=self.codec.field_widths,
+            session=self.session,
         )
         out: list[tuple[float, bytes, str]] = []
         for rule in self.rules:
             if not rule.matches(frame):
                 continue
+            if rule.once and rule.name in self._fired:
+                continue
+            # Capture before rendering, so a rule can reference in its own
+            # responses what it just captured from the frame that triggered it.
+            for key, template in rule.capture.items():
+                self.session[key] = render_template(template, ctx)
+            if rule.once:
+                self._fired.add(rule.name)
             for i, spec in enumerate(rule.responses):
                 label = spec.label or f"{rule.name}[{i}]"
                 if spec.raw is not None:

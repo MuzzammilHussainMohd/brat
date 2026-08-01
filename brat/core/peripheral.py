@@ -16,7 +16,9 @@ lazily so the recon half of BRAT works without it.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
@@ -139,6 +141,12 @@ class LogEntry:
     # command" - keeping this a plain bool instead of substring-matching
     # `decoded` text is what makes that distinction reliable.
     frame_ok: bool = False
+    # For "tx" entries: whether a central had actually subscribed to the
+    # characteristic at the moment we handed the bytes to BlueZ. `update_value`
+    # cannot tell us - it returns True whether or not anyone is listening - so
+    # without this a session log of unheard notifications is indistinguishable
+    # from one the client received. None means unknowable (no bless app).
+    delivered: bool | None = None
     # Insertion order, stamped by SessionLog.add(). `timestamp` is a bare
     # HH:MM:SS.ffffff string with no date - a session that runs past midnight
     # makes string/time comparison on it silently wrong (every post-midnight
@@ -157,6 +165,7 @@ class LogEntry:
             "label": self.label or None,
             "origin": self.origin,
             "frame_ok": self.frame_ok,
+            "delivered": self.delivered,
             "seq": self.seq,
         }
 
@@ -218,19 +227,28 @@ class RoguePeripheral:
         self.quiet = quiet
         self.on_frame = on_frame
         self.adapter = adapter
+        self._warnings: list[str] = []
 
+        # Deliberately does NOT fall back to profile.match.name: that field is
+        # a glob (see MatchSpec in profile.py), matched with fnmatch. Putting
+        # it on the air would broadcast a literal "Mira-*", and bless derives
+        # its D-Bus object path from the name by stripping every character
+        # outside [A-Za-z0-9_] - so a name made only of glob punctuation
+        # yields the invalid path "/org/bluez//advertisement1" and a failure
+        # that points nowhere near the profile. Kept identical to the chain in
+        # commands/impersonate.py so the printed banner cannot disagree with
+        # what is actually broadcast.
         self.advertised_name = (
-            name_override
-            or profile.advertising.local_name
-            or profile.match.name
-            or profile.name
+            name_override or profile.advertising.local_name or profile.name
         )
+        self._check_advertised_name()
 
         self.log = SessionLog()
         self.connected = False
         self.central_address: str | None = None
         self._watch_bus = None
         self._watch_task: asyncio.Task | None = None
+        self._sub_task: asyncio.Task | None = None
         # Profile-declared characteristic values, served from `_on_read`.
         # Held here rather than in the characteristic's own cached D-Bus
         # property so that BlueZ has to call us for every read.
@@ -238,7 +256,6 @@ class RoguePeripheral:
         self._server = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._notify_uuids: list[str] = []
-        self._warnings: list[str] = []
         # Registered-characteristic objects, keyed by (service_uuid, char_uuid).
         # bless's own `get_characteristic(uuid)` is a server-wide, first-match
         # lookup with no service scoping - if the same characteristic UUID
@@ -263,6 +280,32 @@ class RoguePeripheral:
         # `char.value = X` assignment before either calls update_value, and
         # the central receives the wrong (or duplicate) payload.
         self._notify_lock = asyncio.Lock()
+        # In-flight response coroutines, so stop() can let them finish rather
+        # than cutting them off mid-delay, and so their exceptions are seen.
+        self._pending: set[asyncio.Task] = set()
+        # Formatted tracebacks from the response path. Without somewhere for
+        # these to go they were discarded with the Future that carried them,
+        # and a profile bug looked exactly like a silent client.
+        self._errors: list[str] = []
+
+    def _check_advertised_name(self) -> None:
+        name = self.advertised_name or ""
+        if not re.sub(r"[^A-Za-z0-9_]", "", name):
+            raise PeripheralError(
+                f"advertised name {name!r} contains no [A-Za-z0-9_] characters.\n"
+                "  bless builds its D-Bus object path from the name "
+                '(base_path = "/org/bluez/" + the name with everything else\n'
+                '  stripped), so this produces the invalid path '
+                '"/org/bluez//advertisement1" and an unattributable\n'
+                "  registration failure. Set advertising.local_name in the profile, "
+                "or pass --name."
+            )
+        if any(c in name for c in "*?["):
+            self._warnings.append(
+                f"advertised name {name!r} looks like a glob - it will be broadcast "
+                "literally, wildcards and all. match.name is a pattern for finding a "
+                "device; advertising.local_name is the name to broadcast."
+            )
 
     # -- protocol -----------------------------------------------------------
 
@@ -427,8 +470,56 @@ class RoguePeripheral:
         if self.on_frame and frame is not None:
             self.on_frame(frame, entry)
 
-        if frame is not None and self._loop is not None:
-            asyncio.run_coroutine_threadsafe(self._respond(frame, uuid), self._loop)
+        if frame is not None:
+            self._schedule_response(
+                self._respond(frame, uuid),
+                f"response to {self.protocol.command_name(frame.cmd) if self.protocol else 'frame'}",
+            )
+
+    def _schedule_response(self, coro, what: str) -> None:
+        """Run a response coroutine, keeping hold of it and of its failures.
+
+        The previous version handed the coroutine to `run_coroutine_threadsafe`
+        and dropped the Future, so every exception raised while building or
+        sending a response - a bad template, a missing blob, an unregistered
+        characteristic - vanished with no traceback and no output. Combined
+        with a profile that has no emulation rules, that made "the profile
+        cannot answer" and "the client asked for nothing" look identical.
+        """
+        loop = self._loop
+        if loop is None:
+            coro.close()
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+
+        if running is loop:
+            # The normal path: bless dispatches write_request_func on the
+            # asyncio loop thread via dbus_next, so we are already on it.
+            task: asyncio.Future = loop.create_task(coro)
+        else:
+            task = asyncio.ensure_future(
+                asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, loop)),
+                loop=loop,
+            )
+
+        self._pending.add(task)
+        task.add_done_callback(lambda t: self._response_finished(t, what))
+
+    def _response_finished(self, task, what: str) -> None:
+        self._pending.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        self._errors.append(f"{what}: {detail}")
+        # Reported even when quiet. An error suppressed because the operator
+        # asked for JSON output is exactly the failure this exists to prevent.
+        self.console.error(f"{what} failed: {type(exc).__name__}: {exc}")
 
     def _mark_connected(self, address: str | None = None) -> None:
         """Record that a central is attached.
@@ -459,11 +550,51 @@ class RoguePeripheral:
         if not self.connected:
             return
         self.connected = False
+        # Anything the protocol captured belonged to the connection that just
+        # ended. Carrying it into the next one would answer a second client
+        # using the first client's identifiers.
+        if self.protocol is not None:
+            self.protocol.reset_session()
         if not self.quiet:
             self.console.write()
             self.console.info(
                 f"Central disconnected{f' ({address})' if address else ''} at {_ts()}"
             )
+
+    async def _subscription_poll_loop(self, interval: float = 0.25) -> None:
+        """Report centrals subscribing to / unsubscribing from notifications.
+
+        A CCCD write is the moment a client says "start sending me things",
+        and for many devices it is what triggers the client's first command -
+        so seeing it, or not seeing it, is the fastest way to tell a working
+        session from a stalled one. It is also what decides whether a notify
+        actually goes on the air, since `update_value()` reports success
+        either way.
+
+        Polled rather than hooked because bless calls `app.StartNotify(None)`
+        *before* appending the UUID to `subscribed_characteristics`, so the
+        hook cannot tell which characteristic was subscribed. Reading the list
+        is in-process state - no D-Bus, no adapter - so this runs regardless
+        of whether the connection watch managed to start.
+        """
+        seen: set[str] = set()
+        while True:
+            await asyncio.sleep(interval)
+            current = self._subscribed()
+            if current is None:
+                continue
+            for uuid in sorted(current - seen):
+                if not self.quiet:
+                    self.console.ok(
+                        f"Central subscribed to {uuid_label(uuid, 'characteristic')} "
+                        f"{self.console.dim(uuid)}"
+                    )
+            for uuid in sorted(seen - current):
+                if not self.quiet:
+                    self.console.info(
+                        f"Central unsubscribed from {uuid_label(uuid, 'characteristic')}"
+                    )
+            seen = current
 
     async def _start_connection_watch(self) -> None:
         """Poll BlueZ for real link-layer connect/disconnect events.
@@ -631,19 +762,50 @@ class RoguePeripheral:
             sent = self._server.update_value(service_uuid, target)
 
         if sent is False:
+            # bless returns False only when it cannot find the service, so
+            # this is a registration problem, not a delivery one.
             self.console.error(
-                f"notify on {target} was not delivered (update_value returned False) "
-                "- the session log below would otherwise overstate what was sent"
+                f"notify on {target} failed: bless could not resolve service "
+                f"{service_uuid}, so the characteristic was never updated"
             )
             return
 
-        self.log.add(LogEntry(_ts(), "tx", target, data, label=label))
+        subscribed = self._subscribed()
+        delivered = None if subscribed is None else (target in subscribed)
+
+        self.log.add(
+            LogEntry(_ts(), "tx", target, data, label=label, delivered=delivered)
+        )
+        if delivered is False:
+            # update_value() returns True whether or not anyone is listening,
+            # so without saying this the log looks like the client was
+            # answered when in fact BlueZ dropped the notification.
+            self.console.warn(
+                f"notify on {uuid_label(target, 'characteristic')}: no central has "
+                "subscribed to it (no CCCD write seen), so BlueZ will not transmit "
+                "this. The bytes were built correctly but nobody received them."
+            )
         if not self.quiet:
             self.console.write(
                 f"  {self.console.dim('[' + _ts() + ']')} "
                 f"{self.console.green('NOTIFY <-')} {label or 'response'}  ({len(data)}B)"
             )
             self.console.hexdump(data, indent=9)
+
+    def _subscribed(self) -> set[str] | None:
+        """Characteristic UUIDs a central has actually written the CCCD for.
+
+        None when it cannot be known (the stubbed server in tests). bless
+        maintains this in `app.subscribed_characteristics`, appended by
+        BlueZGattCharacteristic.StartNotify - the only trustworthy signal,
+        since `update_value()` reports success whether or not anyone is
+        listening.
+        """
+        app = getattr(self._server, "app", None)
+        subs = getattr(app, "subscribed_characteristics", None)
+        if subs is None:
+            return None
+        return {norm_uuid(u) for u in subs}
 
     def _default_notify_uuid(self) -> str | None:
         """Last-resort response channel.
@@ -799,6 +961,7 @@ class RoguePeripheral:
             raise PeripheralError("build() must run before start()")
         self._apply_advertised_uuids()
         await self._start_connection_watch()
+        self._sub_task = asyncio.create_task(self._subscription_poll_loop())
         try:
             await self._server.start()
         except Exception as exc:  # noqa: BLE001
@@ -896,13 +1059,29 @@ class RoguePeripheral:
         )
 
     async def stop(self, timeout: float = 5.0) -> None:
-        if self._watch_task is not None:
-            self._watch_task.cancel()
+        # Let in-flight responses finish before tearing the server down. Rules
+        # routinely stagger their frames with delays of a second or more to
+        # match real device timing, so cutting them off here would truncate a
+        # handshake that was working and make it look like the client was
+        # ignored.
+        if self._pending:
             try:
-                await self._watch_task
+                await asyncio.wait(set(self._pending), timeout=min(timeout, 3.0))
+            except Exception:  # noqa: BLE001 - teardown is best-effort
+                pass
+            for task in list(self._pending):
+                task.cancel()
+
+        for attr in ("_watch_task", "_sub_task"):
+            task = getattr(self, attr)
+            if task is None:
+                continue
+            task.cancel()
+            try:
+                await task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-            self._watch_task = None
+            setattr(self, attr, None)
         if self._watch_bus is not None:
             try:
                 self._watch_bus.disconnect()
@@ -930,8 +1109,14 @@ class RoguePeripheral:
             "connected": self.connected,
             "central_address": self.central_address,
             "warnings": self._warnings,
+            "errors": list(self._errors),
             "session": self.log.to_dict(),
         }
+
+    @property
+    def errors(self) -> list[str]:
+        """Tracebacks from the response path, if any responses failed to build."""
+        return list(self._errors)
 
 
 async def run_until_interrupt(

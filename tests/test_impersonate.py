@@ -31,6 +31,7 @@ class _FakePeripheral:
     connected: bool
     log: _FakeLog
     advertised_name: str = "Fake-Device"
+    errors: list = field(default_factory=list)
 
 
 @dataclass

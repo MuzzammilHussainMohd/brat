@@ -101,7 +101,18 @@ async def execute(args, console: Console) -> Report:
     blobs = load_blobs(args.payload)
     rule = build_injection_rule(args, profile)
 
-    name = args.name or profile.advertising.local_name or profile.name
+    # Built before the confirmation prompt (construction does no I/O) so the
+    # name quoted in the prompt is the one the radio will actually broadcast,
+    # rather than a second, separately-computed guess at it.
+    peripheral = RoguePeripheral(
+        profile=profile,
+        console=console,
+        name_override=args.name,
+        blobs=blobs,
+        quiet=args.output != "text",
+        adapter=args.adapter,
+    )
+    name = peripheral.advertised_name
     engine = profile.protocol
 
     trigger = (
@@ -132,15 +143,6 @@ async def execute(args, console: Console) -> Report:
     # Injection is appended, so the profile's own handshake rules still run and
     # the client reaches the state where the injected frame makes sense.
     engine.rules.append(rule)
-
-    peripheral = RoguePeripheral(
-        profile=profile,
-        console=console,
-        name_override=args.name,
-        blobs=blobs,
-        quiet=args.output != "text",
-        adapter=args.adapter,
-    )
 
     console.header("ROGUE PERIPHERAL + INJECTION")
     console.kv("profile", f"{profile.name} ({profile.slug})")

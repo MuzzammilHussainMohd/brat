@@ -55,6 +55,20 @@ pip install -e '.[peripheral]'
 brat doctor          # check adapter, BlueZ, and peripheral-mode readiness first
 ```
 
+**On adapters.** For `impersonate` and `inject`, use an ordinary USB Bluetooth
+dongle — Intel, Realtek, CSR. `brat doctor` reads the controller's own BD
+address rather than trusting BlueZ's, because BlueZ invents a static random
+address when the controller has none and will otherwise report a radio that
+cannot advertise at all as perfectly healthy. It also names the nRF52840
+running Zephyr's `hci_usb` firmware as unsupported for peripheral mode: it
+presents a working-looking HCI interface but boots with no address and
+exhausts its own advertising resources across sessions, in a way restarting
+`bluetoothd` cannot clear. Keep that dongle for sniffing.
+
+One sharp edge worth knowing: bless looks for an adapter whose name *contains*
+`hci0` and fails outright otherwise, so if your adapter came up as `hci1` you
+need `--adapter hci1`. `brat doctor` tells you when that applies.
+
 `bleak` and `PyYAML` are the only hard dependencies. `bless` is optional and
 only needed for `impersonate` / `inject`, so recon works on machines that
 cannot act as a peripheral.
@@ -218,8 +232,38 @@ Responses are templates over the request:
 | `{req.raw[a:b]}` | a slice of the raw request frame |
 | `{var.NAME}` | a profile variable |
 | `{blob.NAME}` | a file loaded with `--payload NAME=FILE` |
+| `{sess.NAME}` | a value captured from an earlier frame |
 | `{ts}` / `{ts:u32le}` | current unix time |
 | `{rand:N}` / `{zero:N}` | N random / zero bytes |
+
+All of `req.payload`, `req.raw`, `var.`, `blob.` and `sess.` take an `[a:b]`
+slice. A slice that runs past the end of its source is an error, not a short
+field — silently truncating produces a malformed frame that looks like the
+device replied with nonsense.
+
+Real handshakes need more than the frame in front of them. A device that
+receives an account identifier during authentication has to quote it back in a
+data frame several commands later, so a rule can save one:
+
+```yaml
+  - name: auth
+    on_cmd: 0xA3
+    capture:
+      uid: "{req.payload[0:8]}"     # readable later as {sess.uid}
+
+  - name: data-sync-push
+    on_cmd: 0x90
+    once: true                       # clients that time out restart the
+    respond:                         # handshake; unsolicited pushes must
+      - {cmd: 0x92, delay: 0.2,      # not go out twice
+         payload: "{sess.uid}{blob.sync[8:]}"}
+```
+
+Captures are cleared when the central disconnects, so the next client is never
+answered with the previous one's identifiers. Delays accumulate across every
+response a frame matches, which is how a device that pushes something
+unprompted after a handshake step gets expressed — as a second rule on the
+same command, not as a special "unsolicited" construct.
 
 Length fields and checksums are computed for you. Writing a working device
 emulator is a config exercise, not a programming one.
@@ -257,6 +301,7 @@ exercise. BRAT's findings are worded to that boundary and say so.
 | `brat impersonate` | **yes** | Serve a profile as a rogue peripheral |
 | `brat inject` | **yes** | Serve a profile and feed the client fabricated data |
 | `brat profiles` | no | List, show, and validate profiles |
+| `brat protocol` | no | Infer a frame layout from a capture, or decode against a profile |
 
 Every command supports `-o text|json|jsonl`. JSON is canonical and complete;
 the terminal view is a rendering of it, never the other way round. `--fail-at`
@@ -274,14 +319,37 @@ minimal hand-written template, and check it with:
 brat profiles validate myprofile
 ```
 
-While working out a device's framing, `examples/decode_frame.py` will parse hex
-straight from a sniffer capture or a session log against your draft profile and
-show you what it decoded — and what the profile would reply with:
+### Working out an unknown protocol
+
+A GATT walk sees the pipe, not the frames, so a fresh clone can only listen.
+The loop that closes that:
 
 ```bash
-./examples/decode_frame.py myprofile A5 00 00 D0 E0 A3 00 0E ...
-./examples/decode_frame.py myprofile --session-log session.json
+brat impersonate --profile mydevice --confirm --session-log session.json
+brat protocol infer --session-log session.json          # hex   -> draft block
+# paste the block into the profile, rename the fields
+brat protocol decode --profile mydevice -s session.json # block -> proof
 ```
+
+`infer` looks for the framing constants, an offset whose value tracks the frame
+length, the byte that varies most (the command, usually), and brute-forces
+every checksum preset, byte order and covered range. Then it builds an engine
+from its own output, decodes the same capture back, and refuses to claim
+success below 100% — an inference nobody checked is a guess wearing a suit. It
+says so plainly when there are too few frames, when every frame is the same
+length so a length field cannot be told from a constant, and when no checksum
+fits, rather than inventing an answer.
+
+`decode` is the other direction: it shows what your block made of each frame,
+field by field, and what the profile would have replied with.
+
+Once you know a device family's framing, carry it onto the next unit:
+
+```bash
+brat clone --address <MAC> --protocol-from mydevice
+```
+
+`examples/decode_frame.py` still works and is a short tour of the library API.
 
 Profiles are searched in `$BRAT_PROFILE_PATH`, `./profiles/`,
 `~/.config/brat/profiles/`, then the ones shipped here.
@@ -331,10 +399,15 @@ pip install -e '.[all]'
 pytest -q
 ```
 
-122 tests, no hardware required — the bless server is stubbed, so the peripheral
-engine is testable on a machine with no Bluetooth at all. CRC presets are
-verified against published check values, and the frame codec is verified by
-round-tripping a 237-byte frame recorded off real hardware.
+260 tests, no hardware required. Most of the peripheral suite runs against a
+stubbed bless server, but `tests/test_peripheral_realbless.py` drives the *real*
+one with only D-Bus faked underneath — which is what catches the things a stub
+cannot, since a fake server never performs bless's own flag conversion or builds
+its advertisement. CRC presets are verified against published check values, the
+frame codec is verified by round-tripping a 237-byte frame recorded off real
+hardware, and layout inference is verified by round trip: frames built with a
+known codec, run through `infer` with the codec discarded, must produce the same
+field types and constants back.
 
 Contributions welcome, especially:
 

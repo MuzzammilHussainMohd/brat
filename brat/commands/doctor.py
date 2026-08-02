@@ -492,6 +492,36 @@ async def run_checks() -> tuple[list[Check], list[dict]]:
         )
     )
 
+    # Two adapters in one machine is the obvious way to check impersonate
+    # without a phone - advertise on one, scan with the other - and it does not
+    # work. The packets do arrive: a btmon capture on the scanning adapter
+    # shows both the ADV_IND and the SCAN_RSP. But both adapters answer to the
+    # same bluetoothd, which will not raise a Device1 object for an address
+    # belonging to one of its own controllers, so nothing built on the BlueZ
+    # API - brat scan, bluetoothctl, any bleak program - ever sees it.
+    #
+    # The session then ends with "central connected: no" and every layer looks
+    # broken while being entirely correct. Worth a line here, because the
+    # obvious reading of that silence is that the tool does not transmit.
+    if usable and len(adapters) > 1:
+        advertiser = usable[0]["name"]
+        others = [a["name"] for a in adapters if a["name"] != advertiser]
+        checks.append(
+            Check(
+                "local-adapter-selftest",
+                True,
+                warn=True,
+                detail=f"a scan from {', '.join(others)} cannot see {advertiser} "
+                "advertising - they share one bluetoothd",
+                fix="This is BlueZ behaviour, not a fault, and it is not evidence "
+                f"that nothing was transmitted. To confirm an advertisement really "
+                f"reached the air, capture below BlueZ on the scanning adapter with "
+                f"`btmon --index {others[0].removeprefix('hci')}` and look for "
+                "LE Advertising Report, or use an off-host central such as a phone "
+                "running nRF Connect.",
+            )
+        )
+
     # bless resolves its adapter with a literal substring match on "hci0", not
     # "first available", so a usable adapter that enumerated as hci1 fails with
     # "No adapter named hci0 found" unless --adapter is passed. Worth one line

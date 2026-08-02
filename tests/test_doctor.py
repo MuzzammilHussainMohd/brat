@@ -171,3 +171,25 @@ def test_a_single_healthy_hci0_says_nothing_at_all():
     assert "default-adapter" not in checks
     assert "adapter-firmware" not in checks
     assert checks["adapter-address"].ok and not checks["adapter-address"].warn
+
+
+def test_two_local_adapters_warn_that_they_cannot_see_each_other():
+    """Advertise on one adapter, scan with the other, see nothing - and
+    conclude the tool does not transmit. It does: a btmon capture on the
+    scanning adapter shows the ADV_IND and SCAN_RSP arriving. They share a
+    bluetoothd, which never raises a Device1 for its own controller's
+    address, so the BlueZ API hides what the radio plainly received.
+    """
+    checks = _checks_for([ZEPHYR, HEALTHY])
+    selftest = checks["local-adapter-selftest"]
+
+    assert selftest.ok and selftest.warn
+    assert selftest.fatal_for == []
+    assert "hci1" in selftest.detail and "hci0" in selftest.detail
+    # Must name the way out, not just the problem.
+    assert "btmon --index 0" in selftest.fix
+
+
+def test_one_adapter_alone_has_nothing_to_warn_about():
+    checks = _checks_for([dict(HEALTHY, name="hci0")])
+    assert "local-adapter-selftest" not in checks

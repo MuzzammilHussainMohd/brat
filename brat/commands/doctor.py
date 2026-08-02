@@ -30,6 +30,12 @@ class Check:
     detail: str = ""
     fix: str = ""
     fatal_for: list[str] = field(default_factory=list)
+    # Something is wrong but nothing is blocked by it - a broken adapter
+    # sitting next to a working one, or a working one that needs a flag.
+    # Rendering these as FAIL alongside a READY verdict is the same kind of
+    # misleading output this command exists to prevent, so they get their own
+    # level: still shown, still carrying their fix, but not red.
+    warn: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -38,6 +44,7 @@ class Check:
             "detail": self.detail,
             "fix": self.fix,
             "blocks": self.fatal_for,
+            "warn": self.warn,
         }
 
 
@@ -375,24 +382,45 @@ async def run_checks() -> tuple[list[Check], list[dict]]:
     # this check - which read that property - could never fire on the very
     # dongle it was written for, and doctor cheerfully declared impersonate
     # ready on hardware that provably could not do it.
+    # The one gate that matters for peripheral mode: an adapter with the
+    # interfaces that can actually use them. `peripheral-mode` above only
+    # proves the interfaces exist, which the Zephyr dongle satisfies while
+    # being unusable. Computed here rather than at its own check below because
+    # the two checks that follow need to know whether anything covers them: a
+    # dead dongle is only a *blocker* when it is the only radio in the machine.
+    usable = [
+        a
+        for a in advertisers
+        if a["powered"]
+        and a["controller_address"] != "00:00:00:00:00:00"
+        and not _is_zephyr_hci(a)
+    ]
+    covered = (
+        f" - not usable for peripheral mode, but {usable[0]['name']} is"
+        if usable
+        else ""
+    )
+
     zero_addr = [a for a in adapters if a["controller_address"] == "00:00:00:00:00:00"]
     unreadable = [a for a in adapters if a["controller_address"] is None]
     if zero_addr:
         checks.append(
             Check(
                 "adapter-address",
-                False,
+                bool(usable),
+                warn=bool(usable),
                 detail="; ".join(
                     f"{a['name']}: controller reports 00:00:00:00:00:00 "
                     f"(BlueZ reports {a['address']}, which it invented)"
                     for a in zero_addr
-                ),
+                )
+                + covered,
                 fix="The controller booted with no BD address, so it cannot advertise. "
                 "BlueZ synthesises a random static address when this happens, which is "
                 "why `bluetoothctl show` looks fine - it is not evidence. Set an address "
                 "on the controller (btmgmt public-addr, or your dongle's flashing "
                 "script), or use an adapter that has one.",
-                fatal_for=["impersonate", "inject"],
+                fatal_for=[] if usable else ["impersonate", "inject"],
             )
         )
     elif unreadable and adapters:
@@ -430,31 +458,22 @@ async def run_checks() -> tuple[list[Check], list[dict]]:
         checks.append(
             Check(
                 "adapter-firmware",
-                False,
+                bool(usable),
+                warn=bool(usable),
                 detail="; ".join(
                     f"{a['name']} is an nRF/Zephyr hci_usb controller" for a in zephyr
                 )
-                + " - detected, but not supported for peripheral mode",
+                + (covered or " - detected, but not supported for peripheral mode"),
                 fix="Use a generic USB Bluetooth adapter (Intel, Realtek, CSR) for "
                 "impersonate and inject; keep this dongle for sniffing. This firmware "
                 "boots with no BD address, reports no LE advertising features, and "
                 "exhausts its own advertising resources across sessions - a failure a "
                 "bluetoothd restart cannot clear, because it lives on the chip. "
                 "`hciconfig <adapter> down && up` clears it; power-cycling always does.",
-                fatal_for=["impersonate", "inject"],
+                fatal_for=[] if usable else ["impersonate", "inject"],
             )
         )
 
-    # The real gate for peripheral mode: an adapter that has the interfaces
-    # *and* can actually use them. `peripheral-mode` above only proves the
-    # interfaces exist, which the Zephyr dongle satisfies while being unusable.
-    usable = [
-        a
-        for a in advertisers
-        if a["powered"]
-        and a["controller_address"] != "00:00:00:00:00:00"
-        and not _is_zephyr_hci(a)
-    ]
     checks.append(
         Check(
             "usable-peripheral-adapter",
@@ -482,7 +501,8 @@ async def run_checks() -> tuple[list[Check], list[dict]]:
         checks.append(
             Check(
                 "default-adapter",
-                False,
+                True,
+                warn=True,
                 detail=f"the usable adapter is {first}, not hci0",
                 fix=f"Pass --adapter {first} to impersonate and inject. bless looks for "
                 'an adapter whose name contains "hci0" and fails outright otherwise, '
@@ -533,9 +553,14 @@ def _text(report: Report, console: Console) -> None:
     data = report.data
     console.header("ENVIRONMENT")
     for c in data["checks"]:
-        mark = console.green("ok  ") if c["ok"] else console.red("FAIL")
+        if not c["ok"]:
+            mark = console.red("FAIL")
+        elif c.get("warn"):
+            mark = console.yellow("warn")
+        else:
+            mark = console.green("ok  ")
         console.write(f"  [{mark}] {console.bold(c['name']):<24} {c['detail']}")
-        if not c["ok"] and c["fix"]:
+        if (not c["ok"] or c.get("warn")) and c["fix"]:
             console.write(f"          {console.dim('fix:')} {c['fix']}")
 
     if data.get("adapters"):

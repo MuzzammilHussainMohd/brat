@@ -100,3 +100,74 @@ def test_a_synthesized_bluez_address_does_not_mask_a_zero_controller_address():
     assert ZEPHYR["address"] != "00:00:00:00:00:00"
     assert ZEPHYR["controller_address"] == "00:00:00:00:00:00"
     assert _peripheral_verdict(ZEPHYR).startswith("no")
+
+
+def _checks_for(adapters):
+    """Run the real check pipeline over a fixed adapter list, keyed by name."""
+    import asyncio
+
+    from brat.commands import doctor as mod
+
+    async def _fake_adapters():
+        return list(adapters), None
+
+    original = mod._bluez_adapters
+    mod._bluez_adapters = _fake_adapters
+    try:
+        checks, _ = asyncio.run(mod.run_checks())
+    finally:
+        mod._bluez_adapters = original
+    return {c.name: c for c in checks}
+
+
+def _blocked(checks, command):
+    return sorted(n for n, c in checks.items() if not c.ok and command in c.fatal_for)
+
+
+def test_a_dead_dongle_alone_blocks_impersonate():
+    checks = _checks_for([ZEPHYR])
+    assert _blocked(checks, "impersonate") == [
+        "adapter-address",
+        "adapter-firmware",
+        "usable-peripheral-adapter",
+    ]
+
+
+def test_a_dead_dongle_beside_a_working_adapter_blocks_nothing():
+    """The regression: three dongles plugged in, one of them a Realtek that can
+    do everything, and `doctor` still reported impersonate blocked - because
+    adapter-address and adapter-firmware were fatal whenever *any* adapter
+    failed them, rather than deferring to whether one usable radio remained.
+    Saying "blocked" next to a radio that works is the same wrong answer as
+    saying "ready" next to one that doesn't; it just fails in the other
+    direction.
+    """
+    checks = _checks_for([ZEPHYR, HEALTHY])
+
+    assert _blocked(checks, "impersonate") == []
+    assert _blocked(checks, "inject") == []
+    assert checks["usable-peripheral-adapter"].ok
+
+    # Still reported, still carrying its fix - demoted, not silenced.
+    assert checks["adapter-firmware"].warn
+    assert "hci1 is" in checks["adapter-firmware"].detail
+
+
+def test_a_usable_adapter_that_is_not_hci0_warns_about_the_flag():
+    """bless matches the literal substring "hci0", so a working hci1 needs
+    --adapter or it fails at start-up with "No adapter named hci0 found".
+    """
+    checks = _checks_for([ZEPHYR, HEALTHY])
+    default = checks["default-adapter"]
+
+    assert default.ok and default.warn
+    assert default.fatal_for == []
+    assert "--adapter hci1" in default.fix
+
+
+def test_a_single_healthy_hci0_says_nothing_at_all():
+    checks = _checks_for([dict(HEALTHY, name="hci0")])
+
+    assert "default-adapter" not in checks
+    assert "adapter-firmware" not in checks
+    assert checks["adapter-address"].ok and not checks["adapter-address"].warn

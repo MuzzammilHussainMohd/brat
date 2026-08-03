@@ -21,9 +21,11 @@ typical workflow:
   brat posture --address AA:BB:CC:DD:EE:FF       does it demand authentication?
   brat clone   --address AA:BB:CC:DD:EE:FF       write a profile from the device
   brat impersonate --profile mydevice --confirm  become it, log what connects
+  brat drive --profile mydevice -a AA:.. --confirm  drive the real device instead
 
-Recon and posture commands only read. `impersonate` and `inject` transmit and
-require --confirm. Point them only at hardware you own or are authorised to test.
+Recon and posture commands only read. `impersonate`, `inject`, and `drive`
+transmit and require --confirm. Point them only at hardware you own or are
+authorised to test.
 """
 
 
@@ -251,6 +253,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm", action="store_true", help="required: acknowledge that this transmits"
     )
 
+    # -- drive --------------------------------------------------------------
+    p_drv = sub.add_parser(
+        "drive",
+        parents=[common],
+        help="connect to a real device and issue protocol commands [transmits]",
+        description="Act as a rogue central: connect to the named device without "
+        "pairing and send it correctly framed protocol commands. Where `posture` "
+        "reports that the command channel is writable, this reports what the device "
+        "does when someone writes to it. Requires --confirm.",
+        epilog="Send a read-back command before and after a state-changing one to\n"
+        "prove the change came from the command:\n"
+        "  brat drive -p dev -a AA:BB:CC:DD:EE:FF --send 30 --send 20:00 --send 30 --confirm\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_drv.add_argument("-p", "--profile", required=True, help="profile supplying the protocol")
+    p_drv.add_argument("-a", "--address", required=True, help="target MAC address")
+    p_drv.add_argument("--cmd", help="command byte to send, e.g. 0x20")
+    p_drv.add_argument("--payload", help="payload hex for --cmd, e.g. 00")
+    p_drv.add_argument(
+        "--send",
+        action="append",
+        metavar="CMD[:PAYLOAD]",
+        help="add a command to the sequence, in order (repeatable), e.g. --send 20:00",
+    )
+    p_drv.add_argument(
+        "-t", "--timeout", type=float, default=20.0, help="connection timeout"
+    )
+    p_drv.add_argument(
+        "--wait",
+        type=float,
+        default=2.0,
+        help="seconds to collect replies after each command (default: 2)",
+    )
+    p_drv.add_argument(
+        "--gap", type=float, default=0.0, help="pause between commands (default: 0)"
+    )
+    p_drv.add_argument("--session-log", help="write the full exchange to this JSON file")
+    p_drv.add_argument(
+        "--confirm", action="store_true", help="required: acknowledge that this transmits"
+    )
+
     # -- profiles -----------------------------------------------------------
     p_prof = sub.add_parser(
         "profiles",
@@ -314,7 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # Commands that transmit, and therefore need the terms acknowledged.
-_TRANSMITTING = {"impersonate", "inject"}
+_TRANSMITTING = {"impersonate", "inject", "drive"}
 
 _MODULES = {
     "doctor": "doctor",
@@ -324,6 +367,7 @@ _MODULES = {
     "clone": "clone",
     "impersonate": "impersonate",
     "inject": "inject",
+    "drive": "drive",
     "profiles": "profiles",
     "protocol": "protocol",
 }

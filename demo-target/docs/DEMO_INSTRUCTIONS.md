@@ -215,7 +215,72 @@ No drama needed here; it's supporting evidence for posture.
 
 ---
 
-### Step 5 — Protocol infer (decode the wire protocol)
+### Step 5 — Drive (rogue central — attack the device itself)
+
+> **This is the strongest single result in the demo.** Everything so far has
+> been reconnaissance. This is the first step that *changes the device*, and
+> the effect is physical and visible across the room.
+
+**Before running**: let the board sit until glucose drifts below 70 mg/dL —
+**LED1 will be lit** (urgent low alarm). That takes about 75 seconds from boot.
+Point at the lit LED so the audience sees the starting state.
+
+```bash
+sudo python3 -m brat drive --profile glucosense_open --adapter hci0 \
+    --address E5:E2:89:A3:8D:F1 \
+    --send 30 --send 20:00 --send 30 --wait 1.5 --confirm
+```
+
+**What to say while it runs**: "No phone, no app, no pairing. I'm connecting
+straight to the device as an unauthorised client. I ask its status, I tell it
+to silence the alarm, I ask its status again."
+
+**Audience sees** — the terminal prints a proven state change:
+
+```
+STATE CHANGE PROVEN
+  probe:      0x30 (STATUS)
+  before:     0028 01 00 01000001
+  after:      0028 00 00 01000001
+    byte 2:   01 -> 00
+  caused by:  0x20 (ALARM_SET)
+
+CRITICAL  An unauthenticated command changed device state
+```
+
+**And LED1 on the board goes out.**
+
+Now decode the payload out loud — this is the whole talk in one line:
+
+| | glucose | alarm | authenticated |
+|---|---|---|---|
+| before | `0028` = **40 mg/dL** | `01` = **ON** | `00` = **no** |
+| after | `0028` = **40 mg/dL** | `00` = **OFF** | `00` = **no** |
+
+> "The glucose reading did not change. It is still 40 milligrams per decilitre —
+> that is a medical emergency. The only thing that changed is that the alarm is
+> now off. And look at the third field: the device's own status says
+> `authenticated: no`. It knows I never authenticated. It did it anyway."
+
+**Why this matters more than a spoofed phone display**: BRAT did not have to
+know what any of these commands mean. It sent a read, a write, and the same
+read again, and the device's own reply proved the write took effect. That
+inference works against any framed protocol.
+
+**Optional — the reverse, if time allows.** Fabricating an emergency is as easy
+as silencing one:
+
+```bash
+sudo python3 -m brat drive --profile glucosense_open --adapter hci0 \
+    --address E5:E2:89:A3:8D:F1 \
+    --send 30 --send 20:01 --send 30 --wait 1.5 --confirm
+```
+
+LED1 comes back on. Same finding, `byte 2: 00 -> 01`.
+
+---
+
+### Step 6 — Protocol infer (decode the wire protocol)
 
 > This requires a live session log with all 5 commands. Run the app first:
 > let it connect to the real device and do a few STATUS polls. The session
@@ -235,7 +300,7 @@ CRC-16/MODBUS detected.
 
 ---
 
-### Step 6 — Clone (copy the identity)
+### Step 7 — Clone (copy the identity)
 
 ```bash
 sudo python3 -m brat clone --adapter hci0 --name GlucoSense-OPEN
@@ -249,7 +314,7 @@ which was already cloned from this device).
 
 ---
 
-### Step 7 — Impersonate (stand up the rogue peripheral)
+### Step 8 — Impersonate (stand up the rogue peripheral)
 
 **Before running**: force-stop the GlucoSense app on the phone (swipe it away
 in the app switcher). The real DK board may stay powered.
@@ -272,9 +337,9 @@ man-in-the-middle foundation."
 
 ---
 
-### Step 8 — Inject (falsify glucose reading)
+### Step 9 — Inject (falsify glucose reading)
 
-> This is the climax. The phone is already connected to the rogue from Step 7.
+> This is the climax. The phone is already connected to the rogue from Step 8.
 > Open a second terminal and run inject while impersonate is still running.
 
 ```bash
@@ -303,7 +368,7 @@ the rogue is contradicting the real device.
 
 ---
 
-### Step 9 — Contrast with v2 (the fix)
+### Step 10 — Contrast with v2 (the fix)
 
 Stop everything. Flash v2 to the DK:
 
@@ -317,7 +382,7 @@ The board reboots and advertises as `GlucoSense-SECURE`.
 
 ```bash
 sudo python3 -m brat posture --profile glucosense_open --adapter hci0 \
-    --target <v2-MAC>
+    --address <v2-MAC>
 ```
 
 (Scan first to get the MAC: `sudo python3 -m brat scan --adapter hci0 --timeout 6`)
@@ -325,6 +390,26 @@ sudo python3 -m brat posture --profile glucosense_open --adapter hci0 \
 **Audience sees**: 0 CRITICAL, 0 HIGH. Verdict: green. Every read attempt
 returns `Insufficient Authentication`. The DFU write returns `Insufficient
 Encryption`.
+
+**Then try the same rogue-central attack that worked in Step 5**:
+
+```bash
+sudo python3 -m brat drive --profile glucosense_open --adapter hci0 \
+    --address <v2-MAC> --send 30 --send 20:00 --send 30 --wait 1.5 --confirm
+```
+
+**Audience sees**: every write refused at the ATT layer, and an INFO finding
+instead of a CRITICAL:
+
+```
+INFO  Device refused protocol commands from an unauthenticated peer
+      protocol.commands-refused
+```
+
+**And LED1 stays lit.** The alarm cannot be silenced by anyone who has not
+bonded with a passkey.
+
+> "Same command. Same tool. Same three frames. The device now says no."
 
 **Then try impersonation against v2**:
 
@@ -371,6 +456,14 @@ sudo python3 -m brat posture --profile glucosense_open --adapter hci0
 
 # Full GATT tree
 sudo python3 -m brat enum --profile glucosense_open --adapter hci0
+
+# Rogue central — drive the REAL device (silences the alarm, LED1 goes out)
+sudo python3 -m brat drive --profile glucosense_open --adapter hci0 \
+    --address E5:E2:89:A3:8D:F1 --send 30 --send 20:00 --send 30 --wait 1.5 --confirm
+
+# ...and the reverse: fabricate an alarm (LED1 comes on)
+sudo python3 -m brat drive --profile glucosense_open --adapter hci0 \
+    --address E5:E2:89:A3:8D:F1 --send 30 --send 20:01 --send 30 --wait 1.5 --confirm
 
 # Clone identity
 sudo python3 -m brat clone --adapter hci0 --name GlucoSense-OPEN
@@ -505,7 +598,7 @@ with that option on — it must not be set. Check `prj.conf` — if you see
 
 ## The Key Message (one slide)
 
-> **The attack (Steps 1-8) took 4 minutes. The fix (prj_secure.conf diff) is
+> **The attack (Steps 1-9) took 5 minutes. The fix (prj_secure.conf diff) is
 > 5 Kconfig lines. The gap between "nothing" and "good enough" is smaller
 > than anyone thinks.**
 

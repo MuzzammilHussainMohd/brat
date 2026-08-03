@@ -183,7 +183,12 @@ def _add_findings(report: Report, entries: list[dict]) -> None:
                 Finding(
                     check="privacy.static-address",
                     title=f"Static, trackable BLE address ({entry['address_type']})",
-                    severity=Severity.LOW,
+                    # Same severity as posture's identical check. The address
+                    # either rotates or it does not; which command happened to
+                    # observe it cannot change how serious that is, and seeing
+                    # one finding reported at two severities in one session
+                    # reads as the tool being arbitrary.
+                    severity=Severity.MEDIUM,
                     target=address,
                     confidence=Confidence.CONFIRMED,
                     description=(

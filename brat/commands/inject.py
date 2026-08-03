@@ -94,6 +94,43 @@ def build_injection_rule(args, profile) -> EmulationRule:
     )
 
 
+def install_injection_rule(engine, rule: EmulationRule) -> list[str]:
+    """Add the injection rule, displacing any profile rule with the same trigger.
+
+    Returns the names of the rules that were removed.
+
+    The injection is appended rather than replacing everything, so the
+    profile's own handshake rules still run and the client reaches the state
+    where the injected frame makes sense.
+
+    But a profile rule answering the *same* command must not survive alongside
+    it. `responses_for` collects responses from every matching rule, so leaving
+    both in place answers one request twice with conflicting content: the
+    profile's reply lands first and the injected one arrives milliseconds
+    later, so a client that renders the first answer shows exactly the value
+    the operator was trying to replace. The injection looks inert while both
+    frames were in fact sent - and two answers to one request is not something
+    a real device does, so the capture stops resembling the protocol it is
+    imitating.
+
+    Only exact command collisions are dropped. A catch-all (`on_any`) rule is
+    left alone: it fires for every command, and removing it to change one would
+    silently break the rest of the emulation.
+    """
+    suppressed: list[str] = []
+    if rule.on_cmd is not None:
+        kept = []
+        for existing in engine.rules:
+            if existing.on_cmd == rule.on_cmd:
+                suppressed.append(existing.name)
+            else:
+                kept.append(existing)
+        engine.rules = kept
+
+    engine.rules.append(rule)
+    return suppressed
+
+
 async def execute(args, console: Console) -> Report:
     profile = load_profile(args.profile)
     report = Report(command="inject", target=profile.slug)
@@ -140,9 +177,7 @@ async def execute(args, console: Console) -> Report:
         report.data = {"confirmed": False, "profile": profile.slug}
         return report
 
-    # Injection is appended, so the profile's own handshake rules still run and
-    # the client reaches the state where the injected frame makes sense.
-    engine.rules.append(rule)
+    suppressed = install_injection_rule(engine, rule)
 
     console.header("ROGUE PERIPHERAL + INJECTION")
     console.kv("profile", f"{profile.name} ({profile.slug})")
@@ -151,6 +186,15 @@ async def execute(args, console: Console) -> Report:
     console.kv("normal rules", len(engine.rules) - 1)
     console.kv("injection trigger", trigger)
     console.kv("injected frames", len(rule.responses))
+    # Say which rules were displaced. Silently dropping part of the profile's
+    # emulation would be its own trap: a later response that depends on one of
+    # these having run would fail for no visible reason.
+    if suppressed:
+        console.kv(
+            "replaced rules",
+            f"{', '.join(suppressed)} (same trigger - the profile's reply to "
+            f"{trigger} is not sent)",
+        )
     if blobs:
         console.kv("payloads", ", ".join(f"{k} ({len(v)}B)" for k, v in blobs.items()))
 
@@ -175,6 +219,7 @@ async def execute(args, console: Console) -> Report:
         "trigger": trigger,
         "injected_frames": len(injected),
         "injected_bytes": sum(len(e.data) for e in injected),
+        "replaced_rules": suppressed,
         **summary,
     }
 
@@ -192,7 +237,7 @@ async def execute(args, console: Console) -> Report:
 
 
 def _add_findings(report: Report, peripheral, profile, injected: list) -> None:
-    if not peripheral.connected:
+    if not peripheral.ever_connected:
         report.note("No client connected; nothing was injected.")
         return
 

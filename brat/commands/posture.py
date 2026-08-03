@@ -53,6 +53,51 @@ _UNVERIFIED_NO_RESPONSE = "unverified-no-response"
 # Characteristics whose contents identify a person or a specific unit.
 _IDENTITY_CHARS = {"2a23", "2a25", "2a50"}
 
+# Generic Access and Generic Attribute. BlueZ (and every other host stack)
+# provides these itself and refuses to let an application serve them, so their
+# characteristics are present and readable on every device regardless of how
+# well it is secured. Anything concluded from reading them describes the stack,
+# not the target.
+_STACK_SERVICES = {norm_uuid("1800"), norm_uuid("1801")}
+
+
+def _is_stack_owned(service_uuid: str) -> bool:
+    return norm_uuid(service_uuid) in _STACK_SERVICES
+
+
+def _reads_stalled_on_a_live_link(ctx: "PostureContext") -> bool:
+    """Whether a read failed abnormally while the connection was working.
+
+    A peripheral that requires bonding does not necessarily answer an unpaired
+    read with an ATT error. Against BlueZ the usual outcome is that the host
+    starts pairing on the peripheral's behalf, cannot finish it without a
+    passkey, and then one of two things happens: the read never returns
+    (TIMEOUT), or the peripheral tears the link down (DISCONNECTED, with an
+    authentication-failure reason on the wire). Which of the two you get is not
+    stable - the same device over the same adapter produced both across
+    consecutive runs.
+
+    Both must count, or the verdict flips between runs for no reason the
+    operator can see: recognising only the timeout made a secured device report
+    a CRITICAL on one run and nothing on the next.
+
+    Distinguishing this from a device that is simply broken or out of range
+    needs the rest of the session: if other characteristics on the same
+    connection answered, the link was alive and a characteristic that failed
+    was behaving differently for a reason. That is evidence, not proof, which
+    is why callers use it only to soften an INFERRED verdict and never to
+    assert enforcement outright.
+    """
+    if not ctx.connected_unpaired:
+        return False
+
+    results = [c.get("read_result") for _s, c in ctx.characteristics()]
+    refused_abnormally = any(
+        r in (GattResult.TIMEOUT.value, GattResult.DISCONNECTED.value) for r in results
+    )
+    responded = any(r == GattResult.SUCCESS.value for r in results)
+    return refused_abnormally and responded
+
 
 @dataclass
 class PostureContext:
@@ -153,7 +198,19 @@ def check_link(ctx: PostureContext) -> list[Finding]:
     readable = [
         (s, c) for s, c in ctx.characteristics() if c.get("read_result") == "success"
     ]
-    if readable:
+
+    # Generic Access and Generic Attribute are mandatory and the host stack
+    # serves them itself, so their characteristics answer on every BLE device
+    # ever built - including a correctly secured one. Treating them as proof
+    # that "data is transferred unencrypted" made this finding fire at HIGH
+    # against every target, which is the same as carrying no information:
+    # a device that gates every one of its own characteristics scored
+    # identically to one that gates none. Only the device's own
+    # characteristics can answer this question.
+    device_readable = [(s, c) for s, c in readable if not _is_stack_owned(s["uuid"])]
+    stack_only = bool(readable) and not device_readable
+
+    if device_readable:
         findings.append(
             Finding(
                 check="link.no-encryption",
@@ -168,14 +225,36 @@ def check_link(ctx: PostureContext) -> list[Finding]:
                     "by any passive sniffer in range."
                 ),
                 evidence={
-                    "characteristics_read": len(readable),
-                    "example": readable[0][1]["uuid"],
+                    "characteristics_read": len(device_readable),
+                    "example": device_readable[0][1]["uuid"],
                 },
                 remediation=(
                     "Mandate an encrypted link (LE Secure Connections) before "
                     "permitting reads."
                 ),
                 references=["Bluetooth Core Spec, Vol 3, Part H (Security Manager)"],
+            )
+        )
+    elif stack_only:
+        findings.append(
+            Finding(
+                check="link.stack-characteristics-only",
+                title="Only mandatory stack characteristics were readable",
+                severity=Severity.INFO,
+                target=ctx.address,
+                confidence=Confidence.CONFIRMED,
+                description=(
+                    "Reads succeeded, but every one of them was a Generic Access or "
+                    "Generic Attribute characteristic - device name, appearance, "
+                    "connection parameters and the like. Those are mandatory, served "
+                    "by the host stack, and readable on every BLE device including "
+                    "correctly secured ones, so they say nothing about this device's "
+                    "posture. None of the device's own characteristics returned data "
+                    "to an unpaired peer."
+                ),
+                evidence={
+                    "stack_characteristics_read": [c["uuid"] for _s, c in readable],
+                },
             )
         )
 
@@ -363,8 +442,19 @@ def check_write_exposure(ctx: PostureContext) -> list[Finding]:
         return []
 
     findings: list[Finding] = []
+    # Stack-owned characteristics are excluded for the same reason as in
+    # check_link: Generic Access/Attribute are served by the host stack and
+    # behave identically on every device. Client Supported Features (2b29) in
+    # particular is *meant* to be written by any client, so a zero-length
+    # write to it always succeeds - and was producing a CRITICAL
+    # "accepts writes without authentication" against a device whose own
+    # characteristics all refused. It surfaced only intermittently, because
+    # the probe has to reach it before a secured peripheral drops the link,
+    # which made the whole verdict look nondeterministic.
     all_writable = [
-        (s, c) for s, c in ctx.characteristics() if _WRITE_PROPS & set(c["properties"])
+        (s, c)
+        for s, c in ctx.characteristics()
+        if _WRITE_PROPS & set(c["properties"]) and not _is_stack_owned(s["uuid"])
     ]
     if not all_writable:
         return findings
@@ -535,7 +625,7 @@ def check_dfu(ctx: PostureContext) -> list[Finding]:
             GattResult.AUTHORIZATION_REQUIRED.value,
         )
         for _s, c in ctx.characteristics()
-    )
+    ) or _reads_stalled_on_a_live_link(ctx)
 
     findings: list[Finding] = []
     for _service, char in ctx.characteristics():
@@ -1153,15 +1243,48 @@ def render(report: Report, console: Console) -> None:
 
     console.write()
     if data["connected_unpaired"]:
+        # Only the device's own characteristics count. Generic Access and
+        # Generic Attribute answer on every BLE device including a properly
+        # secured one, so a verdict driven by them says the same thing about
+        # every target and is worth nothing.
+        device_read = any(
+            c.get("read_result") == "success"
+            for s in data.get("services", [])
+            for c in s.get("characteristics", [])
+            if not _is_stack_owned(s["uuid"])
+        )
         any_read_succeeded = any(
             c.get("read_result") == "success"
             for s in data.get("services", [])
             for c in s.get("characteristics", [])
         )
-        if any_read_succeeded:
+        stalled = any(
+            c.get("read_result") in ("timeout", "disconnected")
+            for s in data.get("services", [])
+            for c in s.get("characteristics", [])
+        )
+        if device_read:
             console.write(
                 "  " + console.red("VERDICT: ") +
                 "connected and read data with no pairing, no authentication, no encryption."
+            )
+        elif any_read_succeeded:
+            console.write(
+                "  " + console.green("VERDICT: ") +
+                "connected without pairing, but none of the device's own characteristics "
+                "returned data."
+            )
+            console.write(
+                "           Only mandatory Generic Access/Attribute characteristics were "
+                "readable, and those answer on every BLE device including correctly "
+                "secured ones."
+                + (
+                    " At least one characteristic stopped responding rather than "
+                    "refusing outright, which is what a peripheral demanding a bond "
+                    "typically looks like through BlueZ."
+                    if stalled
+                    else ""
+                )
             )
         else:
             console.write(

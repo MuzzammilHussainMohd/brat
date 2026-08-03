@@ -278,3 +278,166 @@ def test_resolvable_private_address_gets_no_note_and_no_finding():
     findings = check_privacy(ctx)
     assert not any("could not be determined" in note for note in ctx.skipped)
     assert "privacy.static-address" not in [f.check for f in findings]
+
+
+# ---------------------------------------------------------------------------
+# Stack-owned characteristics must not drive the encryption verdict.
+#
+# Generic Access / Generic Attribute are mandatory and served by the host
+# stack, so they answer on every BLE device including a correctly secured one.
+# Concluding "data is transferred unencrypted" from reading a device name made
+# the finding fire against every target at HIGH, which carries no information:
+# a device gating all of its own characteristics scored the same as one gating
+# none.
+# ---------------------------------------------------------------------------
+
+
+def _stack_service(chars: list[dict]) -> dict:
+    return {"uuid": "00001800-0000-1000-8000-00805f9b34fb", "characteristics": chars}
+
+
+def test_reading_only_stack_characteristics_is_not_an_encryption_failure():
+    ctx = PostureContext(
+        address="AA:BB:CC:DD:EE:FF",
+        connected_unpaired=True,
+        services=[
+            _stack_service(
+                [
+                    _char("2a00", ["read"], read_result="success"),
+                    _char("2a01", ["read"], read_result="success"),
+                ]
+            ),
+        ],
+    )
+    checks = [f.check for f in check_link(ctx)]
+    assert "link.no-encryption" not in checks
+    assert "link.stack-characteristics-only" in checks
+
+
+def test_reading_a_device_characteristic_is_still_an_encryption_failure():
+    """The softening must not swallow a genuine finding."""
+    ctx = PostureContext(
+        address="AA:BB:CC:DD:EE:FF",
+        connected_unpaired=True,
+        services=[
+            _stack_service([_char("2a00", ["read"], read_result="success")]),
+            _service([_char("2a18", ["read"], read_result="success")]),
+        ],
+    )
+    checks = [f.check for f in check_link(ctx)]
+    assert "link.no-encryption" in checks
+    assert "link.stack-characteristics-only" not in checks
+
+
+# ---------------------------------------------------------------------------
+# A read that stalls on a live link is evidence of enforcement.
+#
+# A peripheral requiring a bond often does not answer an unpaired read with an
+# ATT error: through BlueZ the read simply never returns, because the host
+# starts pairing on the peripheral's behalf and cannot finish it. Without
+# recognising that, a secured device produced the same CRITICAL DFU verdict as
+# an untested one.
+# ---------------------------------------------------------------------------
+
+
+def test_stalled_read_on_a_live_link_softens_the_dfu_verdict():
+    ctx = PostureContext(
+        address="AA:BB:CC:DD:EE:FF",
+        connected_unpaired=True,
+        services=[
+            _stack_service([_char("2a00", ["read"], read_result="success")]),
+            _service(
+                [
+                    _char("2a18", ["read"], read_result=GattResult.TIMEOUT.value),
+                    _char(_DFU_UUID, ["write", "indicate"]),
+                ]
+            ),
+        ],
+    )
+    dfu = next(f for f in check_dfu(ctx) if f.check == "gatt.dfu-exposed")
+    assert dfu.severity.name == "HIGH"
+    assert dfu.evidence["other_characteristics_enforced_auth"] is True
+
+
+def test_stall_with_nothing_else_responding_is_not_evidence():
+    """An unresponsive device must not be mistaken for a secured one."""
+    ctx = PostureContext(
+        address="AA:BB:CC:DD:EE:FF",
+        connected_unpaired=True,
+        services=[
+            _service(
+                [
+                    _char("2a18", ["read"], read_result=GattResult.TIMEOUT.value),
+                    _char(_DFU_UUID, ["write", "indicate"]),
+                ]
+            ),
+        ],
+    )
+    dfu = next(f for f in check_dfu(ctx) if f.check == "gatt.dfu-exposed")
+    assert dfu.severity.name == "CRITICAL"
+
+
+def test_disconnect_during_a_read_also_counts_as_enforcement():
+    """Regression: the refusal arrives as TIMEOUT or DISCONNECTED, unpredictably.
+
+    A peripheral demanding a bond either stalls the read or tears the link
+    down, and which one you get is not stable - the same device over the same
+    adapter produced both across consecutive runs. Recognising only the
+    timeout made the verdict flip between runs: CRITICAL on one, clean on the
+    next, with nothing the operator could see to explain it.
+    """
+    ctx = PostureContext(
+        address="AA:BB:CC:DD:EE:FF",
+        connected_unpaired=True,
+        services=[
+            _stack_service([_char("2a00", ["read"], read_result="success")]),
+            _service(
+                [
+                    _char("2a18", ["read"], read_result=GattResult.DISCONNECTED.value),
+                    _char(_DFU_UUID, ["write", "indicate"]),
+                ]
+            ),
+        ],
+    )
+    dfu = next(f for f in check_dfu(ctx) if f.check == "gatt.dfu-exposed")
+    assert dfu.severity.name == "HIGH"
+    assert dfu.evidence["other_characteristics_enforced_auth"] is True
+
+
+def test_stack_characteristic_write_is_not_an_unauthenticated_write_finding():
+    """Regression: Client Supported Features (2b29) is writable on every device.
+
+    It lives in Generic Attribute, the host stack serves it, and clients are
+    *supposed* to write their feature bitmap to it - so a zero-length probe
+    always succeeds. Counting that produced a CRITICAL "accepts writes without
+    authentication" against a device whose own characteristics all refused,
+    and only intermittently, because the probe has to reach it before a
+    secured peripheral drops the link. The verdict flipped between runs with
+    nothing visible to explain it.
+    """
+    ctx = PostureContext(
+        address="AA:BB:CC:DD:EE:FF",
+        connected_unpaired=True,
+        services=[
+            {
+                "uuid": "00001801-0000-1000-8000-00805f9b34fb",
+                "characteristics": [_char("2b29", ["read", "write"], read_result="success")],
+            },
+        ],
+        write_probes={"2b29": GattResult.SUCCESS.value},
+    )
+    checks = [f.check for f in check_write_exposure(ctx)]
+    assert "gatt.write-unauthenticated" not in checks
+
+
+def test_device_characteristic_write_is_still_critical():
+    """The exclusion must not swallow a genuine confirmed write."""
+    ctx = PostureContext(
+        address="AA:BB:CC:DD:EE:FF",
+        connected_unpaired=True,
+        services=[_service([_char("6e400002-b5a3-f393-e0a9-e50e24dcca9e", ["write"])])],
+        write_probes={"6e400002-b5a3-f393-e0a9-e50e24dcca9e": GattResult.SUCCESS.value},
+    )
+    findings = check_write_exposure(ctx)
+    hit = next(f for f in findings if f.check == "gatt.write-unauthenticated")
+    assert hit.severity.name == "CRITICAL"

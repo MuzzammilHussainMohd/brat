@@ -1242,3 +1242,72 @@ def test_a_short_name_beside_a_vendor_uuid_warns_about_nothing(console):
 
     assert rogue._fitted_advertised_uuids() == [NUS_SERVICE]
     assert rogue.warnings == []
+
+
+def test_summary_reports_a_client_that_connected_then_left(peripheral):
+    """Regression: `summary()['connected']` must mean "ever", not "right now".
+
+    A client that connects, does its business and disconnects before the
+    operator stops the tool is the normal shape of a session. Reading the
+    live `connected` flag at teardown reported those sessions as though no
+    client had ever attached, which is the exact inverse of what happened.
+    """
+    asyncio.run(peripheral.build())
+
+    peripheral._mark_connected("AA:BB:CC:DD:EE:FF")
+    assert peripheral.summary()["connected"] is True
+
+    peripheral._mark_disconnected("AA:BB:CC:DD:EE:FF")
+
+    assert peripheral.connected is False          # live state: gone
+    assert peripheral.ever_connected is True      # session record: it happened
+    summary = peripheral.summary()
+    assert summary["connected"] is True
+    assert summary["connected_now"] is False
+    assert summary["session"]["connected_at"] is not None
+
+
+def test_connected_at_records_the_first_attach_not_the_latest(peripheral, monkeypatch):
+    """Regression: `connected_at` is labelled "first activity" and must be it.
+
+    `connected` returns to False on disconnect, so the early-return guard in
+    `_mark_connected` does not stop a reconnect from reaching the assignment.
+    Reassigning left the session record holding the most recent attach while
+    it was reported as the first - a real session with four connections
+    displayed the fourth one's timestamp.
+
+    The clock is stubbed deliberately: `_ts()` has millisecond resolution, so
+    consecutive calls in a test land in the same tick and every timestamp
+    compares equal, which makes the assertion pass whether or not the bug is
+    present. An earlier version of this test did exactly that and caught
+    nothing.
+    """
+    ticks = iter([f"00:00:0{n}.000" for n in range(1, 9)])
+    monkeypatch.setattr("brat.core.peripheral._ts", lambda: next(ticks))
+
+    asyncio.run(peripheral.build())
+
+    peripheral._mark_connected("AA:BB:CC:DD:EE:FF")
+    first = peripheral.log.connected_at
+    assert first == "00:00:01.000"
+
+    peripheral._mark_disconnected("AA:BB:CC:DD:EE:FF")
+    peripheral._mark_connected("11:22:33:44:55:66")
+    peripheral._mark_disconnected("11:22:33:44:55:66")
+    peripheral._mark_connected("77:88:99:AA:BB:CC")
+
+    assert peripheral.log.connected_at == first
+    assert peripheral.summary()["session"]["connected_at"] == first
+    # The latest peer is still tracked separately - only the timestamp is pinned.
+    assert peripheral.central_address == "77:88:99:AA:BB:CC"
+
+
+def test_summary_counts_separate_connections(peripheral):
+    asyncio.run(peripheral.build())
+    assert peripheral.summary()["connections"] == 0
+
+    peripheral._mark_connected("AA:BB:CC:DD:EE:FF")
+    peripheral._mark_disconnected("AA:BB:CC:DD:EE:FF")
+    peripheral._mark_connected("11:22:33:44:55:66")
+
+    assert peripheral.summary()["connections"] == 2

@@ -92,8 +92,14 @@ async def execute(args, console: Console) -> Report:
     console.header("ROGUE PERIPHERAL")
     console.kv("profile", f"{profile.name} ({profile.slug})")
     console.kv("advertising as", name)
+    # "contains", not "serving": this prints before the GATT server is built,
+    # so it is the profile's inventory and not evidence anything registered.
+    # BlueZ refuses Generic Access/Attribute, so the two genuinely differ on
+    # almost every cloned profile - and labelling this "serving" made a
+    # peripheral that registered only some of its services look healthy.
+    # What was actually served is reported in the session summary.
     console.kv(
-        "serving",
+        "profile contains",
         f"{len(profile.services)} services, "
         f"{sum(len(s.characteristics) for s in profile.services)} characteristics",
     )
@@ -148,7 +154,7 @@ def _add_findings(report: Report, peripheral: RoguePeripheral, profile) -> None:
             f"than the client's:\n{err}"
         )
 
-    if not peripheral.connected:
+    if not peripheral.ever_connected:
         report.note(
             "No central connected during this session, so nothing was demonstrated. "
             "If you expected a connection: make sure the real device is powered off "
@@ -296,9 +302,21 @@ def render(report: Report, console: Console) -> None:
 
     session = data.get("session", {})
     console.header("SESSION SUMMARY")
+    # Served counts, not profile counts - a mismatch against the header is the
+    # signal that something did not register.
+    if data.get("services_served") is not None:
+        console.kv(
+            "served",
+            f"{data['services_served']} services, "
+            f"{data.get('characteristics_served', 0)} characteristics",
+        )
     console.kv("central connected", "yes" if data.get("connected") else "no")
     if session.get("connected_at"):
         console.kv("first activity", session["connected_at"])
+    # A client that reconnects repeatedly and one that stays put are very
+    # different sessions, and the timestamps alone do not distinguish them.
+    if (count := data.get("connections", 0)) > 1:
+        console.kv("connections", count)
     console.kv("frames received", session.get("received", 0))
     console.kv("frames sent", session.get("sent", 0))
 

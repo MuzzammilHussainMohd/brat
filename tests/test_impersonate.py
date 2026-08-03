@@ -1,9 +1,13 @@
 """`brat impersonate` finding generation.
 
-`_add_findings` only touches `.connected`, `.log.rx`, `.log.tx`, and
+`_add_findings` only touches `.ever_connected`, `.log.rx`, `.log.tx`, and
 `.advertised_name`, so a small duck-typed stub exercises it without needing a
 real bless-backed `RoguePeripheral` - same reasoning as the `FakeServer` stub
 in test_peripheral.py.
+
+Note `.ever_connected` rather than `.connected`: the latter is live state and
+goes back to False on disconnect, so reporting keyed off it misread a real
+impersonation as a session in which nothing happened.
 """
 
 from dataclasses import dataclass, field
@@ -32,6 +36,14 @@ class _FakePeripheral:
     log: _FakeLog
     advertised_name: str = "Fake-Device"
     errors: list = field(default_factory=list)
+    # Defaults to mirroring `connected` so existing cases read unchanged, but
+    # can be set independently to model a client that connected and then left
+    # before the operator stopped the tool.
+    ever_connected: bool | None = None
+
+    def __post_init__(self):
+        if self.ever_connected is None:
+            self.ever_connected = self.connected
 
 
 @dataclass
@@ -134,3 +146,52 @@ def test_frame_ok_true_produces_the_protocol_command_finding():
 
     checks = [f.check for f in report.findings]
     assert "protocol.no-peripheral-authentication" in checks
+
+
+# ---------------------------------------------------------------------------
+# Regression: a client that disconnects before the operator stops the tool.
+#
+# `connected` is live state and returns to False on disconnect, so reporting
+# that read it summarised a real, successful impersonation as "no central
+# connected" and skipped every finding - the exact opposite of what happened.
+# Reporting must key off `ever_connected` instead.
+# ---------------------------------------------------------------------------
+
+
+def test_client_that_disconnected_before_stop_still_reports_findings():
+    report = Report(command="impersonate")
+    log = _FakeLog([LogEntry("00:00:01", "tx", "uuid", b"\x01", origin="read-reply")])
+    peripheral = _FakePeripheral(connected=False, ever_connected=True, log=log)
+
+    _add_findings(report, peripheral, _FakeProfile())
+
+    checks = [f.check for f in report.findings]
+    assert "peripheral.impersonation-connected-only" in checks
+    assert not any("No central connected" in n for n in report.notes)
+
+
+def test_disconnected_client_that_wrote_still_reports_critical():
+    """The headline finding must survive the client having already left."""
+    report = Report(command="impersonate")
+    log = _FakeLog(
+        [
+            LogEntry("00:00:01", "rx", "uuid", b"\x7e\x01", decoded="CMD=0x01", frame_ok=True),
+        ]
+    )
+    peripheral = _FakePeripheral(connected=False, ever_connected=True, log=log)
+
+    _add_findings(report, peripheral, _FakeProfile())
+
+    checks = [f.check for f in report.findings]
+    assert "peripheral.impersonation-accepted" in checks
+
+
+def test_never_connected_is_still_reported_as_nothing_demonstrated():
+    """The genuine no-connection case must keep its note and produce no findings."""
+    report = Report(command="impersonate")
+    peripheral = _FakePeripheral(connected=False, ever_connected=False, log=_FakeLog([]))
+
+    _add_findings(report, peripheral, _FakeProfile())
+
+    assert len(report.findings) == 0
+    assert any("No central connected" in n for n in report.notes)

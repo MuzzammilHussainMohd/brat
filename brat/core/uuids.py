@@ -384,6 +384,48 @@ for _u, _label in _HEALTH_SERVICES.items():
         ),
     )
 
+# The measurement characteristics themselves, not just their parent services.
+#
+# Registering only the service left a gap that mattered on exactly the devices
+# this category exists for: `posture` asks whether each *characteristic* is
+# sensitive, so a glucose reading returned to an unpaired peer was bucketed
+# with Device Name and Appearance as an ordinary MEDIUM read. The service entry
+# above never fired for it, because a service UUID is not a characteristic UUID.
+#
+# These carry the patient data itself, so they are HIGH rather than the MEDIUM
+# used for the service: a service UUID only tells you what kind of device this
+# is, while one of these hands over the reading.
+_HEALTH_MEASUREMENT_CHARS = {
+    "2a18": "Glucose Measurement",
+    "2a1c": "Temperature Measurement",
+    "2a1e": "Intermediate Temperature",
+    "2a35": "Blood Pressure Measurement",
+    "2a36": "Intermediate Cuff Pressure",
+    "2a37": "Heart Rate Measurement",
+    "2a5f": "CGM Measurement",
+    "2a9d": "Weight Measurement",
+}
+
+for _u, _label in _HEALTH_MEASUREMENT_CHARS.items():
+    _risk(
+        _u,
+        RiskEntry(
+            label=_label,
+            severity=Severity.HIGH,
+            category="sensitive-data",
+            rationale=(
+                f"{_label} carries a patient measurement. Readable or notifiable "
+                "without an encrypted, authenticated link means the reading itself "
+                "- not merely the fact that the device exists - is available to "
+                "anyone in radio range."
+            ),
+            remediation=(
+                "Require an encrypted, authenticated link before serving any "
+                "measurement characteristic."
+            ),
+        ),
+    )
+
 # Insulin delivery is not merely a confidentiality problem.
 _risk(
     "183a",

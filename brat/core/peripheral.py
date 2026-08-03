@@ -275,6 +275,10 @@ class RoguePeripheral:
 
         self.log = SessionLog()
         self.connected = False
+        # How many separate centrals attached over the session. A reconnect
+        # loop and a single steady client are very different results, and the
+        # summary otherwise cannot tell them apart.
+        self.connections = 0
         self.central_address: str | None = None
         self._watch_bus = None
         self._watch_task: asyncio.Task | None = None
@@ -357,6 +361,49 @@ class RoguePeripheral:
 
     # -- build --------------------------------------------------------------
 
+    def _force_primary(self, service: "ServiceSpec") -> None:
+        """Mark a just-added service primary when the profile says it is.
+
+        bless decides this for us and gets it wrong for any device with more
+        than one service: `BlueZGattApplication.add_service` sets
+        `primary = (index == 1)`, so only the first service added is primary
+        and every later one is registered as a *secondary* service.
+
+        A secondary service is not a lesser primary one - the spec says it is
+        not returned by primary service discovery at all, because it exists
+        only to be included by a primary service. So the second and subsequent
+        services are served, exported on D-Bus, and completely invisible to a
+        client doing ordinary discovery.
+
+        That produced a silent, near-undebuggable failure: a real client
+        connects to the impersonated device and cannot find a service the
+        profile plainly contains, while BRAT reports the session as fine.
+        Whichever service happened to be listed first worked, which made it
+        look like the *characteristic* was at fault rather than the ordering.
+
+        `Primary` is a read-only D-Bus property read by BlueZ during
+        RegisterApplication, and that happens later in `start()`, so amending
+        the flag here - before registration - is enough. Reaching into bless's
+        internals is not lovely; the alternative is shipping a peripheral that
+        can only ever serve one service.
+        """
+        if not getattr(service, "primary", True):
+            return
+
+        bless_service = self._server.get_service(service.uuid)
+        gatt = getattr(bless_service, "gatt", None)
+        if gatt is None or getattr(gatt, "_primary", None) is not False:
+            # Nothing to correct, or bless's internals have moved. Either way
+            # this is best-effort: say so rather than failing the session.
+            if gatt is None and bless_service is not None:
+                self._warnings.append(
+                    f"could not confirm {service.uuid} is registered as a primary "
+                    "service; if a client cannot discover it, this is why"
+                )
+            return
+
+        gatt._primary = True
+
     async def build(self) -> None:
         BlessServer, props_enum, perms_enum, desc_props_enum = _require_bless()
 
@@ -380,6 +427,7 @@ class RoguePeripheral:
                 continue
 
             await self._server.add_new_service(service.uuid)
+            self._force_primary(service)
             self._served_service_count += 1
 
             for char in service.characteristics:
@@ -569,6 +617,19 @@ class RoguePeripheral:
         # asked for JSON output is exactly the failure this exists to prevent.
         self.console.error(f"{what} failed: {type(exc).__name__}: {exc}")
 
+    @property
+    def ever_connected(self) -> bool:
+        """Whether any central attached at any point this session.
+
+        Distinct from `connected`, which is live state and goes back to False
+        on disconnect. Reporting must use this: a client that connects, does
+        its business and disconnects before the operator stops the tool - the
+        normal way a session ends - would otherwise be summarised as "no
+        central connected", turning the single most important result the
+        peripheral commands can produce into a claim that nothing happened.
+        """
+        return self.log.connected_at is not None
+
     def _mark_connected(self, address: str | None = None) -> None:
         """Record that a central is attached.
 
@@ -581,17 +642,24 @@ class RoguePeripheral:
         if self.connected:
             return
         self.connected = True
-        self.log.connected_at = _ts()
+
+        now = _ts()
+        # Set once, not per connection. `connected` returns to False on
+        # disconnect, so the guard above does not stop a reconnect from
+        # reaching here - and reassigning would leave the session record
+        # holding the *most recent* attach while it is reported as the first.
+        # A session with four connections showed the fourth one's timestamp.
+        self.connections += 1
+        if self.log.connected_at is None:
+            self.log.connected_at = now
+
         if not self.quiet:
             self.console.write()
             if address:
-                self.console.ok(
-                    f"Central connected: {address} (at {self.log.connected_at})"
-                )
+                self.console.ok(f"Central connected: {address} (at {now})")
             else:
                 self.console.ok(
-                    f"Central connected (inferred from first GATT operation at "
-                    f"{self.log.connected_at})"
+                    f"Central connected (inferred from first GATT operation at {now})"
                 )
 
     def _mark_disconnected(self, address: str | None = None) -> None:
@@ -1295,7 +1363,12 @@ class RoguePeripheral:
             "characteristics_served": self._served_characteristic_count,
             "notify_characteristics": self._notify_uuids,
             "protocol": self.protocol.name if self.protocol else None,
-            "connected": self.connected,
+            # Deliberately `ever_connected`, not the live `connected` flag -
+            # a summary is a record of the session, not a snapshot of the
+            # instant it was torn down.
+            "connected": self.ever_connected,
+            "connected_now": self.connected,
+            "connections": self.connections,
             "central_address": self.central_address,
             "warnings": self._warnings,
             "errors": list(self._errors),

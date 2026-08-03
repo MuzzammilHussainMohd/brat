@@ -1,37 +1,29 @@
-# BRAT device profile - Mira Ultra4 fertility analyser
+# BRAT device profile - Example NUS Device
 #
 # Reference profile and worked example of a `protocol:` block. Included because
 # a toolkit that only ships generic machinery gives you nothing to read; this
 # shows what a complete profile looks like once you have reverse engineered a
 # device's framing.
 #
-# SCRUBBED. Every value here is either a structural constant or synthetic.
-# No account identifiers, tokens, or measurement data from any real session
-# appear in this file, and none should be added to it.
+# Every value here is either a structural constant or synthetic. Use this as a
+# template when building profiles for your own devices.
 #
-# The GATT tree is transcribed from a published handle map, not from a live
-# clone. Regenerate it against your own unit for an exact tree:
+# To clone a real device instead of writing by hand:
 #
-#   brat clone --address <YOUR_DEVICE_MAC> --slug mira_ultra4
-#
-# Disclosure: the weaknesses this profile exercises were reported to the vendor
-# and to regulators, and several are fixed in current production firmware. The
-# profile is published to demonstrate the *class* of flaw, not to attack
-# shipping devices. Use it against a unit you own.
+#   brat clone --address <YOUR_DEVICE_MAC> --slug my_device
 
 brat_profile_version: 1
 
 device:
-  slug: mira_ultra4
-  name: Mira Ultra4
-  vendor: Quanovate
-  model: Ultra4
-  source: transcribed from published GATT handle map; protocol block hand-authored
+  slug: example_nus_device
+  name: Example NUS Device
+  vendor: Example Vendor
+  model: NUS-Demo
+  source: synthetic example profile
   notes: >
-    Nordic nRF52-based analyser. Application traffic is a framed protocol
-    carried over Nordic UART Service; GATT itself enforces nothing. The device
-    also exposes a Nordic Buttonless Secure DFU characteristic that accepts an
-    unauthenticated write to trigger a reboot into bootloader.
+    Nordic nRF52-based device using Nordic UART Service for application traffic.
+    Demonstrates a typical insecure configuration: no encryption at the link
+    layer, application protocol accepts any correctly-framed command.
 
 # ---------------------------------------------------------------------------
 # Recognising the device in a scan.
@@ -39,12 +31,12 @@ device:
 # spoofed - which is the entire point of `brat impersonate`.
 # ---------------------------------------------------------------------------
 match:
-  name: Mira-Analyzer
+  name: Example-Device
   service_uuids:
     - 6e400001-b5a3-f393-e0a9-e50e24dcca9e
 
 advertising:
-  local_name: Mira-Analyzer
+  local_name: Example-Device
   service_uuids:
     - 6e400001-b5a3-f393-e0a9-e50e24dcca9e
 
@@ -76,7 +68,7 @@ gatt:
         - uuid: 00002a00-0000-1000-8000-00805f9b34fb
           name: Device Name
           properties: [read]
-          value: 4d6972612d416e616c797a6572          # "Mira-Analyzer"
+          value: 4d6972612d416e616c797a6572          # "Example-Device"
         - uuid: 00002a01-0000-1000-8000-00805f9b34fb
           name: Appearance
           properties: [read]
@@ -138,7 +130,7 @@ gatt:
 # which is easy to misread as padding until a large response arrives.
 # ---------------------------------------------------------------------------
 protocol:
-  name: mira-a5
+  name: example-a5
   description: >
     Framed command protocol over NUS. No nonce, no signature, no session
     binding - a frame with a valid CRC is accepted on its merits, in either

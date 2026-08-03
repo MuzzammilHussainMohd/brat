@@ -234,20 +234,20 @@ def test_shipped_profiles_are_discoverable(monkeypatch, tmp_path):
     """
     monkeypatch.chdir(tmp_path)
     found = {p.stem for p in available_profiles()}
-    assert "mira_ultra4" in found
+    assert "example_nus_device" in found
     assert "example_wearable" in found
 
 
 def test_profile_resolves_by_slug(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    profile = load_profile("mira_ultra4")
-    assert profile.slug == "mira_ultra4"
+    profile = load_profile("example_nus_device")
+    assert profile.slug == "example_nus_device"
     assert profile.protocol is not None
 
 
-def test_mira_profile_contains_no_captured_identifiers():
+def test_example_profile_contains_no_captured_identifiers():
     """The shipped profile must stay free of real session data."""
-    text = (REPO_PROFILES / "mira_ultra4.yaml").read_text()
+    text = (REPO_PROFILES / "example_nus_device.yaml").read_text()
     # Account identifiers observed in research captures were 6-digit numeric
     # strings followed by "--". Nothing of that shape may appear here.
     import re

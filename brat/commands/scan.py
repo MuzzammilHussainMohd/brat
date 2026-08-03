@@ -3,7 +3,7 @@
 Advertising packets are broadcast in the clear by design, so listening to them
 intercepts nothing private. What this adds over any other scanner is the
 fingerprint step: every result is scored against every known profile, so the
-output says "this is a Mira Ultra4, and there is a profile for it" rather than
+output says "this is a the example device, and there is a profile for it" rather than
 leaving you to recognise a MAC.
 
 It also classifies the address type, which is the cheapest privacy finding in

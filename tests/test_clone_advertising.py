@@ -3,7 +3,7 @@
 The bug these pin came from trusting bleak's `service_uuids` as though it were
 the advertisement's UUID list. It is not: BlueZ's `Device1.UUIDs` is a union of
 what the device advertised and whatever BlueZ cached about it from earlier
-connections. A real clone of a Mira analyser came out advertising
+connections. A real clone of a Nordic analyser came out advertising
 8ec90001-f315-4f60-9fb8-838830daea50 - the Nordic DFU Control Point, which only
 exists while the device is in bootloader mode. BlueZ had cached it from an
 earlier session and reported it alongside the running device's real UUIDs, so
@@ -42,7 +42,7 @@ class FakeScan:
     service_uuids: list
 
 
-def mira_tree():
+def example_tree():
     """The GATT tree of the real unit, as `brat clone` enumerated it."""
     return [
         FakeService(GATT),
@@ -52,7 +52,7 @@ def mira_tree():
     ]
 
 
-def test_the_real_mira_clone_advertises_the_uart_service():
+def test_the_real_clone_advertises_the_uart_service():
     """The exact failure, with the exact inputs.
 
     BlueZ reported only 8ec90001 - the DFU Control Point, which exists only
@@ -61,7 +61,7 @@ def test_the_real_mira_clone_advertises_the_uart_service():
     stale cached UUID, and the fallback picks the vendor service the device
     really does serve.
     """
-    kept, rejected = _advertisable_uuids(FakeScan([DFU_CTRL]), mira_tree())
+    kept, rejected = _advertisable_uuids(FakeScan([DFU_CTRL]), example_tree())
 
     assert kept == [NUS], "should fall back to the vendor service in the tree"
     assert [u for u, _ in rejected] == [DFU_CTRL]
@@ -72,7 +72,7 @@ def test_a_characteristic_uuid_is_never_advertised():
     """A UUID that is in the tree but as a characteristic cannot be
     advertised as a service, and saying so beats calling it stale.
     """
-    kept, rejected = _advertisable_uuids(FakeScan([DFU_CHAR]), mira_tree())
+    kept, rejected = _advertisable_uuids(FakeScan([DFU_CHAR]), example_tree())
 
     assert kept == [NUS]
     assert [u for u, _ in rejected] == [DFU_CHAR]
@@ -80,14 +80,14 @@ def test_a_characteristic_uuid_is_never_advertised():
 
 
 def test_a_served_service_is_kept():
-    kept, rejected = _advertisable_uuids(FakeScan([NUS]), mira_tree())
+    kept, rejected = _advertisable_uuids(FakeScan([NUS]), example_tree())
     assert kept == [NUS]
     assert rejected == []
 
 
 def test_a_uuid_absent_from_the_tree_is_rejected_as_stale():
     stale = "0000abcd-0000-1000-8000-00805f9b34fb"
-    kept, rejected = _advertisable_uuids(FakeScan([stale, NUS]), mira_tree())
+    kept, rejected = _advertisable_uuids(FakeScan([stale, NUS]), example_tree())
 
     assert kept == [NUS]
     assert rejected == [(stale, rejected[0][1])]
@@ -98,7 +98,7 @@ def test_bluez_owned_services_are_never_advertised():
     """A profile cannot serve GAP or GATT, so it must not claim to advertise
     them - BlueZ registers those itself and rejects the attempt.
     """
-    kept, rejected = _advertisable_uuids(FakeScan([GAP, GATT, NUS]), mira_tree())
+    kept, rejected = _advertisable_uuids(FakeScan([GAP, GATT, NUS]), example_tree())
 
     assert kept == [NUS]
     assert {u for u, _ in rejected} == {GAP, GATT}
@@ -120,11 +120,11 @@ def test_fallback_uses_a_sig_service_when_that_is_all_there_is():
 
 
 def test_no_scan_result_still_yields_something_advertisable():
-    kept, rejected = _advertisable_uuids(None, mira_tree())
+    kept, rejected = _advertisable_uuids(None, example_tree())
     assert kept == [NUS]
     assert rejected == []
 
 
 def test_duplicates_are_collapsed():
-    kept, _ = _advertisable_uuids(FakeScan([NUS, NUS.upper()]), mira_tree())
+    kept, _ = _advertisable_uuids(FakeScan([NUS, NUS.upper()]), example_tree())
     assert kept == [NUS]

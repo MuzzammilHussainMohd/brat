@@ -15,3 +15,11 @@ captures/
 profiles/local_*.yaml
 *.session.json
 *.session.jsonl
+
+# Local development artifacts (not published)
+local/
+.claude/
+
+# IDE
+.vscode/
+.idea/

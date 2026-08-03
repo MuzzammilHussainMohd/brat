@@ -164,7 +164,7 @@ class ServiceSpec:
 class MatchSpec:
     """How to recognise this device during a scan."""
 
-    name: str | None = None            # glob, e.g. "Mira-*"
+    name: str | None = None            # glob, e.g. "Device-*"
     name_regex: str | None = None
     address: str | None = None
     service_uuids: list[str] = field(default_factory=list)

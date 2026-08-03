@@ -261,7 +261,7 @@ class RoguePeripheral:
 
         # Deliberately does NOT fall back to profile.match.name: that field is
         # a glob (see MatchSpec in profile.py), matched with fnmatch. Putting
-        # it on the air would broadcast a literal "Mira-*", and bless derives
+        # it on the air would broadcast a literal "Device-*", and bless derives
         # its D-Bus object path from the name by stripping every character
         # outside [A-Za-z0-9_] - so a name made only of glob punctuation
         # yields the invalid path "/org/bluez//advertisement1" and a failure

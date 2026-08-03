@@ -1,6 +1,6 @@
 """Frame-layout inference.
 
-The load-bearing test is `test_recovers_the_mira_layout_exactly`: build frames
+The load-bearing test is `test_recovers_the_example_layout_exactly`: build frames
 with a known-good codec, throw the codec away, and check that inference gets
 the same structure back. If it can rediscover a layout somebody hand-wrote from
 a real capture, it is doing the job.
@@ -21,25 +21,25 @@ from brat.core.protocol import ProtocolEngine
 
 
 @pytest.fixture
-def mira(monkeypatch, tmp_path):
+def engine(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    return load_profile("mira_ultra4").protocol
+    return load_profile("example_nus_device").protocol
 
 
 @pytest.fixture
-def frames(mira):
+def frames(engine):
     """A plausible session: several commands, several payload lengths."""
     return [
-        mira.codec.build({"cmd": 0xA3, "payload": b"IDENT001" + bytes(6)}),
-        mira.codec.build({"cmd": 0x90, "payload": bytes(27)}),
-        mira.codec.build({"cmd": 0x91, "payload": b"\x01"}),
-        mira.codec.build({"cmd": 0x92, "payload": bytes(60)}),
-        mira.codec.build({"cmd": 0xA8, "payload": b""}),
-        mira.codec.build({"cmd": 0x93, "direction": 1, "payload": bytes(12)}),
+        engine.codec.build({"cmd": 0xA3, "payload": b"IDENT001" + bytes(6)}),
+        engine.codec.build({"cmd": 0x90, "payload": bytes(27)}),
+        engine.codec.build({"cmd": 0x91, "payload": b"\x01"}),
+        engine.codec.build({"cmd": 0x92, "payload": bytes(60)}),
+        engine.codec.build({"cmd": 0xA8, "payload": b""}),
+        engine.codec.build({"cmd": 0x93, "direction": 1, "payload": bytes(12)}),
     ]
 
 
-def test_recovers_the_mira_layout_exactly(frames, mira):
+def test_recovers_the_example_layout_exactly(frames, engine):
     result = infer(frames)
 
     assert result.prefix == b"\xa5\x00"
@@ -55,10 +55,10 @@ def test_recovers_the_mira_layout_exactly(frames, mira):
     assert (byte_order, cover_start) == ("big", 0)
 
 
-def test_inferred_field_types_match_the_hand_written_profile(frames, mira):
+def test_inferred_field_types_match_the_hand_written_profile(frames, engine):
     """Names will differ - the operator renames them - but the shape must not."""
     inferred = to_protocol_config(infer(frames))["frame"]["fields"]
-    real = load_profile("mira_ultra4").protocol_config["frame"]["fields"]
+    real = load_profile("example_nus_device").protocol_config["frame"]["fields"]
 
     def shape(fields):
         return [(f["type"], f.get("value")) for f in fields]
@@ -99,20 +99,20 @@ def test_a_constant_after_a_varying_byte_is_still_found(frames):
 # ---------------------------------------------------------------------------
 
 
-def test_too_few_frames_is_said_out_loud(mira):
+def test_too_few_frames_is_said_out_loud(engine):
     two = [
-        mira.codec.build({"cmd": 0xA3, "payload": b"AAAA"}),
-        mira.codec.build({"cmd": 0x91, "payload": b"\x01"}),
+        engine.codec.build({"cmd": 0xA3, "payload": b"AAAA"}),
+        engine.codec.build({"cmd": 0x91, "payload": b"\x01"}),
     ]
     result = infer(two, min_frames=3)
     assert any("at least 3" in n for n in result.notes)
 
 
-def test_uniform_lengths_cannot_yield_a_length_field(mira):
+def test_uniform_lengths_cannot_yield_a_length_field(engine):
     """With every frame the same length, any constant byte "predicts" the
     length perfectly. Reporting one would be noise.
     """
-    same = [mira.codec.build({"cmd": c, "payload": b"AAAA"}) for c in (0x90, 0x91, 0x92)]
+    same = [engine.codec.build({"cmd": c, "payload": b"AAAA"}) for c in (0x90, 0x91, 0x92)]
     result = infer(same)
 
     assert result.length_offset is None

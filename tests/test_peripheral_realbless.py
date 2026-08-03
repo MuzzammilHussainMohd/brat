@@ -60,9 +60,9 @@ def run(peripheral, *, stop=True):
 
 
 @pytest.fixture
-def mira(monkeypatch, tmp_path):
+def profile(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    return load_profile("mira_ultra4")
+    return load_profile("example_nus_device")
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +71,7 @@ def mira(monkeypatch, tmp_path):
 
 
 def test_the_profiles_uuid_goes_on_the_air_not_the_first_registered_service(
-    mira, console, monkeypatch
+    profile, console, monkeypatch
 ):
     """bless hardcodes `advertisement._service_uuids.append(services[0].UUID)`.
 
@@ -81,22 +81,22 @@ def test_the_profiles_uuid_goes_on_the_air_not_the_first_registered_service(
     the monkeypatch fixing it has never had.
     """
     bus, adapter = install(monkeypatch)
-    peripheral = RoguePeripheral(profile=mira, console=console, quiet=True)
+    peripheral = RoguePeripheral(profile=profile, console=console, quiet=True)
     run(peripheral, stop=False)
 
     advertisement = peripheral._server.app.advertisements[-1]
     assert advertisement._service_uuids == [NUS]
     assert FE59 not in advertisement._service_uuids, "the DFU service must not be advertised"
-    assert advertisement._local_name == "Mira-Analyzer"
+    assert advertisement._local_name == "Example-Device"
 
     # And it really was handed to BlueZ.
     registered = adapter.called("call_register_advertisement")
     assert registered and registered[0][0] == advertisement.path
 
 
-def test_the_advertisement_is_exported_on_the_bus(mira, console, monkeypatch):
+def test_the_advertisement_is_exported_on_the_bus(profile, console, monkeypatch):
     bus, _ = install(monkeypatch)
-    peripheral = RoguePeripheral(profile=mira, console=console, quiet=True)
+    peripheral = RoguePeripheral(profile=profile, console=console, quiet=True)
     run(peripheral, stop=False)
 
     assert bus.exported_paths(contains="advertisement")
@@ -134,12 +134,12 @@ def test_manufacturer_data_reaches_the_advertisement(console, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_the_whole_profile_tree_registers_through_real_bless(mira, console, monkeypatch):
+def test_the_whole_profile_tree_registers_through_real_bless(profile, console, monkeypatch):
     """Property flags, permissions and descriptors all survive bless's own
     conversion - which the fake server never performs.
     """
     install(monkeypatch)
-    peripheral = RoguePeripheral(profile=mira, console=console, quiet=True)
+    peripheral = RoguePeripheral(profile=profile, console=console, quiet=True)
     run(peripheral, stop=False)
 
     served = peripheral._server.app.services
@@ -181,13 +181,13 @@ def test_extended_properties_does_not_crash_real_registration(console, monkeypat
     assert any("extended-properties" in w for w in peripheral.warnings)
 
 
-def test_the_adapter_argument_is_honoured(mira, console, monkeypatch):
+def test_the_adapter_argument_is_honoured(profile, console, monkeypatch):
     """Never covered before: the fake server's __init__ took no adapter kwarg,
     so every test went down the no-adapter path.
     """
     _, adapter = install(monkeypatch)
     peripheral = RoguePeripheral(
-        profile=mira, console=console, quiet=True, adapter="hci1"
+        profile=profile, console=console, quiet=True, adapter="hci1"
     )
     run(peripheral, stop=False)
 
@@ -200,10 +200,10 @@ def test_the_adapter_argument_is_honoured(mira, console, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_notify_is_undelivered_until_a_central_subscribes(mira, console, monkeypatch):
+def test_notify_is_undelivered_until_a_central_subscribes(profile, console, monkeypatch):
     """Against real bless, whose update_value() returns True either way."""
     install(monkeypatch)
-    peripheral = RoguePeripheral(profile=mira, console=console, quiet=True)
+    peripheral = RoguePeripheral(profile=profile, console=console, quiet=True)
 
     async def scenario():
         await peripheral.build()
@@ -231,7 +231,7 @@ def test_notify_is_undelivered_until_a_central_subscribes(mira, console, monkeyp
 # ---------------------------------------------------------------------------
 
 
-def test_a_failed_advertisement_is_not_left_exported(mira, console, monkeypatch):
+def test_a_failed_advertisement_is_not_left_exported(profile, console, monkeypatch):
     """The patched start_advertising exports the advertisement before the
     registration that fails, so teardown has to undo both. Leaving it behind
     leaks the object and pushes the retry onto advertisement2, since bless
@@ -243,7 +243,7 @@ def test_a_failed_advertisement_is_not_left_exported(mira, console, monkeypatch)
     )
     bus, _ = install(monkeypatch, adapter)
 
-    peripheral = RoguePeripheral(profile=mira, console=console, quiet=True)
+    peripheral = RoguePeripheral(profile=profile, console=console, quiet=True)
     # Recovery is not available in a test environment, so start() will raise;
     # what matters is the state it leaves behind.
     monkeypatch.setattr(peripheral, "_recover_adapter", lambda: (True, "pretended"))
@@ -261,7 +261,7 @@ def test_a_failed_advertisement_is_not_left_exported(mira, console, monkeypatch)
     assert paths[0].endswith("advertisement1")
 
 
-def test_a_failure_that_cannot_be_recovered_explains_itself(mira, console, monkeypatch):
+def test_a_failure_that_cannot_be_recovered_explains_itself(profile, console, monkeypatch):
     from brat.core.peripheral import PeripheralError
 
     adapter = FakeAdapter()
@@ -270,7 +270,7 @@ def test_a_failure_that_cannot_be_recovered_explains_itself(mira, console, monke
     )
     install(monkeypatch, adapter)
 
-    peripheral = RoguePeripheral(profile=mira, console=console, quiet=True)
+    peripheral = RoguePeripheral(profile=profile, console=console, quiet=True)
     monkeypatch.setattr(
         peripheral, "_recover_adapter", lambda: (False, "needs root")
     )

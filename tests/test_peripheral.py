@@ -44,9 +44,9 @@ from bless.backends.descriptor import GATTDescriptorProperties  # noqa: E402
 
 
 @pytest.fixture
-def mira(monkeypatch, tmp_path):
+def profile(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    return load_profile("mira_ultra4")
+    return load_profile("example_nus_device")
 
 
 @pytest.fixture
@@ -94,18 +94,18 @@ def test_empty_properties_default_to_readable():
     assert flags & GATTCharacteristicProperties.read
 
 
-def test_permissions_mirror_the_cloned_device(mira):
+def test_permissions_mirror_the_cloned_device(profile):
     """A clone must not be served more securely than the original.
 
     Serving it with encryption required would make the client behave
     differently against the clone than against the real device.
     """
-    nus_rx = mira.characteristic("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
+    nus_rx = profile.characteristic("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
     perms = build_permissions(nus_rx, GATTAttributePermissions)
     assert perms & GATTAttributePermissions.writeable
     assert not perms & GATTAttributePermissions.write_encryption_required
 
-    nus_tx = mira.characteristic("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
+    nus_tx = profile.characteristic("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
     assert build_permissions(nus_tx, GATTAttributePermissions) & (
         GATTAttributePermissions.readable
     )
@@ -209,7 +209,7 @@ class FakeServer:
 
 
 @pytest.fixture
-def peripheral(mira, console, monkeypatch):
+def peripheral(profile, console, monkeypatch):
     import brat.core.peripheral as mod
 
     monkeypatch.setattr(
@@ -217,7 +217,7 @@ def peripheral(mira, console, monkeypatch):
         "_require_bless",
         lambda: (FakeServer, GATTCharacteristicProperties, GATTAttributePermissions, GATTDescriptorProperties),
     )
-    return RoguePeripheral(profile=mira, console=console, quiet=True)
+    return RoguePeripheral(profile=profile, console=console, quiet=True)
 
 
 def test_build_serves_the_profile_tree(peripheral):
@@ -235,9 +235,9 @@ def test_build_serves_the_profile_tree(peripheral):
     assert peripheral._default_notify_uuid() == "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
 
-def test_write_is_decoded_and_logged(peripheral, mira):
+def test_write_is_decoded_and_logged(peripheral, profile):
     asyncio.run(peripheral.build())
-    engine = mira.protocol
+    engine = profile.protocol
 
     payload = b"IDENT001" + bytes.fromhex("69C1B4B0") + bytes.fromhex("014A")
     frame = engine.codec.build({"direction": 0, "cmd": 0xA3, "payload": payload})
@@ -265,9 +265,9 @@ def test_unrecognised_frame_is_logged_not_dropped(peripheral):
     assert entry.frame_ok is False
 
 
-def test_valid_frame_is_marked_frame_ok(peripheral, mira):
+def test_valid_frame_is_marked_frame_ok(peripheral, profile):
     asyncio.run(peripheral.build())
-    engine = mira.protocol
+    engine = profile.protocol
     payload = b"IDENT001" + bytes.fromhex("69C1B4B0") + bytes.fromhex("014A")
     frame = engine.codec.build({"direction": 0, "cmd": 0xA3, "payload": payload})
 
@@ -278,10 +278,10 @@ def test_valid_frame_is_marked_frame_ok(peripheral, mira):
     assert peripheral.log.rx[0].frame_ok is True
 
 
-def test_corrupt_checksum_frame_is_not_marked_frame_ok(peripheral, mira):
+def test_corrupt_checksum_frame_is_not_marked_frame_ok(peripheral, profile):
     """A structurally valid frame with a bad CRC must not count as a genuine command."""
     asyncio.run(peripheral.build())
-    engine = mira.protocol
+    engine = profile.protocol
     payload = b"IDENT001" + bytes.fromhex("69C1B4B0") + bytes.fromhex("014A")
     frame = bytearray(engine.codec.build({"direction": 0, "cmd": 0xA3, "payload": payload}))
     frame[-2] ^= 0xFF  # corrupt one CRC byte, leaving framing intact
@@ -294,7 +294,7 @@ def test_corrupt_checksum_frame_is_not_marked_frame_ok(peripheral, mira):
     assert entry.frame_ok is False
 
 
-def test_read_reply_is_tagged_and_marks_connected_even_when_quiet(mira, console, monkeypatch):
+def test_read_reply_is_tagged_and_marks_connected_even_when_quiet(profile, console, monkeypatch):
     """Regression: a read-only session must be visible even in quiet/JSON mode."""
     import brat.core.peripheral as mod
 
@@ -303,7 +303,7 @@ def test_read_reply_is_tagged_and_marks_connected_even_when_quiet(mira, console,
         "_require_bless",
         lambda: (FakeServer, GATTCharacteristicProperties, GATTAttributePermissions, GATTDescriptorProperties),
     )
-    rogue = RoguePeripheral(profile=mira, console=console, quiet=True)
+    rogue = RoguePeripheral(profile=profile, console=console, quiet=True)
     asyncio.run(rogue.build())
 
     char = FakeCharacteristic("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
@@ -315,7 +315,7 @@ def test_read_reply_is_tagged_and_marks_connected_even_when_quiet(mira, console,
     assert entry.origin == "read-reply"
 
 
-def test_notify_response_is_tagged_protocol_response(peripheral, mira):
+def test_notify_response_is_tagged_protocol_response(peripheral, profile):
     async def scenario():
         await peripheral.build()
         await peripheral.notify(b"\x01\x02", uuid="6e400003-b5a3-f393-e0a9-e50e24dcca9e")
@@ -325,10 +325,10 @@ def test_notify_response_is_tagged_protocol_response(peripheral, mira):
     assert entry.origin == "protocol-response"
 
 
-def test_emulation_responses_are_sent_on_notify_channel(peripheral, mira):
+def test_emulation_responses_are_sent_on_notify_channel(peripheral, profile):
     async def scenario():
         await peripheral.build()
-        engine = mira.protocol
+        engine = profile.protocol
         payload = b"IDENT001" + bytes.fromhex("69C1B4B0") + bytes.fromhex("014A")
         frame = engine.decode(
             engine.codec.build({"direction": 0, "cmd": 0xA3, "payload": payload})
@@ -345,7 +345,7 @@ def test_emulation_responses_are_sent_on_notify_channel(peripheral, mira):
     assert len(sent) == 2
     assert [e.label for e in sent] == ["A3-ack", "A4-confirm"]
 
-    engine = mira.protocol
+    engine = profile.protocol
     ack = engine.decode(sent[0].data)
     assert ack.checksum_ok and ack.cmd == 0xA3
     assert ack.payload == b"IDENT001\x01"
@@ -358,10 +358,10 @@ def test_emulation_responses_are_sent_on_notify_channel(peripheral, mira):
     assert all(u[1] == "6e400003-b5a3-f393-e0a9-e50e24dcca9e" for u in peripheral._server.updates)
 
 
-def test_dfu_indicate_is_never_the_response_channel(peripheral, mira):
+def test_dfu_indicate_is_never_the_response_channel(peripheral, profile):
     """Regression: an indicating DFU characteristic must not win the default.
 
-    The Mira tree exposes a Buttonless DFU characteristic with `indicate`,
+    The example tree exposes a Buttonless DFU characteristic with `indicate`,
     which is subscribable and appears before NUS TX in the profile. Ranking by
     tree order alone sent every protocol response to the bootloader endpoint.
     """
@@ -375,8 +375,8 @@ def test_dfu_indicate_is_never_the_response_channel(peripheral, mira):
     )
 
 
-def test_explicit_transport_overrides_inference(peripheral, mira):
-    assert mira.protocol.notify_uuid == "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+def test_explicit_transport_overrides_inference(peripheral, profile):
+    assert profile.protocol.notify_uuid == "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
     asyncio.run(peripheral.build())
     # Even given a nonsense source characteristic, the declared channel wins.
     assert (
@@ -395,7 +395,7 @@ def test_response_channel_prefers_same_service(monkeypatch, console, tmp_path):
         lambda: (FakeServer, GATTCharacteristicProperties, GATTAttributePermissions, GATTDescriptorProperties),
     )
     monkeypatch.chdir(tmp_path)
-    profile = load_profile("mira_ultra4")
+    profile = load_profile("example_nus_device")
     profile.protocol_config = {
         **profile.protocol_config,
         "transport": {},  # drop the explicit declaration
@@ -413,24 +413,24 @@ def test_response_channel_prefers_same_service(monkeypatch, console, tmp_path):
 def test_summary_reports_the_session(peripheral):
     asyncio.run(peripheral.build())
     summary = peripheral.summary()
-    assert summary["advertised_name"] == "Mira-Analyzer"
-    assert summary["profile"] == "mira_ultra4"
-    assert summary["protocol"] == "mira-a5"
+    assert summary["advertised_name"] == "Example-Device"
+    assert summary["profile"] == "example_nus_device"
+    assert summary["protocol"] == "example-a5"
     assert summary["connected"] is False
 
 
-def test_summary_counts_only_what_was_actually_served(peripheral, mira):
+def test_summary_counts_only_what_was_actually_served(peripheral, profile):
     """Regression: services_served/characteristics_served must not count
     services build() skipped (BlueZ owns Generic Access/Generic Attribute).
 
-    The Mira profile declares GAP + GATT + NUS, so the served count must be
+    The example profile declares GAP + GATT + NUS, so the served count must be
     fewer services/characteristics than the profile's full tree.
     """
     asyncio.run(peripheral.build())
     summary = peripheral.summary()
 
-    profile_service_count = len(mira.services)
-    profile_char_count = sum(len(s.characteristics) for s in mira.services)
+    profile_service_count = len(profile.services)
+    profile_char_count = sum(len(s.characteristics) for s in profile.services)
 
     assert summary["services_served"] < profile_service_count
     assert summary["characteristics_served"] < profile_char_count
@@ -439,15 +439,15 @@ def test_summary_counts_only_what_was_actually_served(peripheral, mira):
         "00001800-0000-1000-8000-00805f9b34fb",
         "00001801-0000-1000-8000-00805f9b34fb",
     }
-    expected_services = [s for s in mira.services if s.uuid not in skipped_service_uuids]
+    expected_services = [s for s in profile.services if s.uuid not in skipped_service_uuids]
     assert summary["services_served"] == len(expected_services)
     assert summary["characteristics_served"] == sum(
         len(s.characteristics) for s in expected_services
     )
 
 
-def test_name_override_changes_advertised_identity(mira, console):
-    rogue = RoguePeripheral(profile=mira, console=console, name_override="BRAT-Demo")
+def test_name_override_changes_advertised_identity(profile, console):
+    rogue = RoguePeripheral(profile=profile, console=console, name_override="BRAT-Demo")
     assert rogue.advertised_name == "BRAT-Demo"
 
 
@@ -693,7 +693,7 @@ def test_characteristics_register_empty_so_reads_reach_the_handler(console, monk
     assert rogue.log.tx[0].origin == "read-reply"
 
 
-def test_advertised_uuids_come_from_the_profile_not_registration_order(peripheral, mira):
+def test_advertised_uuids_come_from_the_profile_not_registration_order(peripheral, profile):
     """Regression: bless advertises `services[0].UUID` and ignores everything else.
 
     BRAT skips GAP/GATT (BlueZ owns them), so the Mira profile's first
@@ -826,11 +826,11 @@ def test_run_until_interrupt_removes_its_signal_handlers(peripheral, console):
 # ---------------------------------------------------------------------------
 
 
-def _a3_frame(mira):
-    return mira.protocol.codec.build({"cmd": 0xA3, "payload": b"IDENT001" + b"\x00" * 6})
+def _a3_frame(profile):
+    return profile.protocol.codec.build({"cmd": 0xA3, "payload": b"IDENT001" + b"\x00" * 6})
 
 
-def test_response_exception_is_reported_not_swallowed(mira, monkeypatch):
+def test_response_exception_is_reported_not_swallowed(profile, monkeypatch):
     import io
 
     import brat.core.peripheral as mod
@@ -845,7 +845,7 @@ def test_response_exception_is_reported_not_swallowed(mira, monkeypatch):
     # fixtures are in play.
     stream = io.StringIO()
     peripheral = RoguePeripheral(
-        profile=mira,
+        profile=profile,
         console=Console(stream=stream, force_color=False),
         quiet=True,
     )
@@ -858,7 +858,7 @@ def test_response_exception_is_reported_not_swallowed(mira, monkeypatch):
 
     async def scenario():
         peripheral._loop = asyncio.get_running_loop()
-        peripheral._on_write(FakeCharacteristic(NUS_TX), _a3_frame(mira))
+        peripheral._on_write(FakeCharacteristic(NUS_TX), _a3_frame(profile))
         await asyncio.sleep(0.05)
 
     asyncio.run(scenario())
@@ -872,23 +872,23 @@ def test_response_exception_is_reported_not_swallowed(mira, monkeypatch):
     assert "template exploded" in stream.getvalue()
 
 
-def test_response_errors_reach_the_session_summary(peripheral, mira):
+def test_response_errors_reach_the_session_summary(peripheral, profile):
     asyncio.run(peripheral.build())
     peripheral.profile.protocol.responses_for = lambda *a, **k: 1 / 0
 
     async def scenario():
         peripheral._loop = asyncio.get_running_loop()
-        peripheral._on_write(FakeCharacteristic(NUS_TX), _a3_frame(mira))
+        peripheral._on_write(FakeCharacteristic(NUS_TX), _a3_frame(profile))
         await asyncio.sleep(0.05)
 
     asyncio.run(scenario())
     assert any("ZeroDivisionError" in e for e in peripheral.summary()["errors"])
 
 
-def test_pending_responses_are_drained_on_stop(peripheral, mira):
+def test_pending_responses_are_drained_on_stop(peripheral, profile):
     """A rule that staggers frames must not be cut off by teardown.
 
-    The Mira profile's A4 confirm is 1.2s behind its A3 ack; stopping without
+    The example profile's A4 confirm is 1.2s behind its A3 ack; stopping without
     draining loses it and the session reads as though the client was ignored.
     """
     asyncio.run(peripheral.build())
@@ -902,7 +902,7 @@ def test_pending_responses_are_drained_on_stop(peripheral, mira):
 
     async def scenario():
         peripheral._loop = asyncio.get_running_loop()
-        peripheral._on_write(FakeCharacteristic(NUS_TX), _a3_frame(mira))
+        peripheral._on_write(FakeCharacteristic(NUS_TX), _a3_frame(profile))
         assert peripheral._pending, "the response was not tracked"
         await peripheral.stop()
 
@@ -969,17 +969,17 @@ def _profile_named(match_name, local_name=None, device_name="Device"):
 
 def test_match_name_glob_never_becomes_the_advertised_name(console):
     """match.name is an fnmatch pattern for *finding* a device. Broadcasting
-    it would put a literal "Mira-*" on the air.
+    it would put a literal "Device-*" on the air.
     """
-    profile = _profile_named("Mira-*", device_name="Mira Ultra4")
+    profile = _profile_named("Device-*", device_name="Example NUS Device")
     rogue = RoguePeripheral(profile=profile, console=console, quiet=True)
-    assert rogue.advertised_name == "Mira Ultra4"
+    assert rogue.advertised_name == "Example NUS Device"
 
 
 def test_advertising_local_name_wins_over_the_device_name(console):
-    profile = _profile_named("Mira-*", local_name="Mira-Analyzer", device_name="Mira Ultra4")
+    profile = _profile_named("Device-*", local_name="Example-Device", device_name="Example NUS Device")
     rogue = RoguePeripheral(profile=profile, console=console, quiet=True)
-    assert rogue.advertised_name == "Mira-Analyzer"
+    assert rogue.advertised_name == "Example-Device"
 
 
 def test_a_name_with_no_usable_characters_is_refused(console):
@@ -995,12 +995,12 @@ def test_a_name_with_no_usable_characters_is_refused(console):
 
 
 def test_a_glob_looking_name_warns(console):
-    profile = _profile_named("x", local_name="Mira-*", device_name="d")
+    profile = _profile_named("x", local_name="Device-*", device_name="d")
     rogue = RoguePeripheral(profile=profile, console=console, quiet=True)
     assert any("looks like a glob" in w for w in rogue.warnings)
 
 
-def test_adapter_is_passed_through_to_the_server(mira, console, monkeypatch):
+def test_adapter_is_passed_through_to_the_server(profile, console, monkeypatch):
     import brat.core.peripheral as mod
 
     monkeypatch.setattr(
@@ -1008,7 +1008,7 @@ def test_adapter_is_passed_through_to_the_server(mira, console, monkeypatch):
         "_require_bless",
         lambda: (FakeServer, GATTCharacteristicProperties, GATTAttributePermissions, GATTDescriptorProperties),
     )
-    rogue = RoguePeripheral(profile=mira, console=console, quiet=True, adapter="hci1")
+    rogue = RoguePeripheral(profile=profile, console=console, quiet=True, adapter="hci1")
     asyncio.run(rogue.build())
     assert rogue._server.adapter == "hci1"
 
@@ -1229,7 +1229,7 @@ def test_a_long_name_beside_a_vendor_uuid_warns_about_the_scan_response(console)
     scan response rather than failing, so the UUID must NOT be dropped - but
     a client that never scan-requests will not see the name.
     """
-    profile = _advertising_profile(local_name="Mira-Analyzer", service_uuids=[NUS_SERVICE])
+    profile = _advertising_profile(local_name="Example-Device", service_uuids=[NUS_SERVICE])
     rogue = RoguePeripheral(profile=profile, console=console, quiet=True)
 
     assert rogue._fitted_advertised_uuids() == [NUS_SERVICE], "the UUID must survive"

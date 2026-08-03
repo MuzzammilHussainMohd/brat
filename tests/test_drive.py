@@ -28,9 +28,9 @@ from brat.core.report import Report
 
 @pytest.fixture
 def engine():
-    profile = load_profile("glucosense_open")
+    profile = load_profile("example_medical_device")
     if profile.protocol_config is None:
-        pytest.skip("glucosense_open has no protocol block")
+        pytest.skip("example_medical_device has no protocol block")
     return ProtocolEngine(profile.protocol_config)
 
 

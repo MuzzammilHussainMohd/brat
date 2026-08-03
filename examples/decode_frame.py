@@ -5,8 +5,8 @@ Handy while writing a `protocol:` block: paste hex you pulled out of a sniffer
 capture or a `brat impersonate` session log and check that your field list and
 checksum settings actually parse it.
 
-    ./examples/decode_frame.py mira_ultra4 A5 00 00 D0 E0 A3 00 0E ...
-    ./examples/decode_frame.py mira_ultra4 --session-log session.json
+    ./examples/decode_frame.py example_nus_device A5 00 00 D0 E0 A3 00 0E ...
+    ./examples/decode_frame.py example_nus_device --session-log session.json
 
 Also serves as a short tour of the library API - every BRAT command is built
 from these same pieces.

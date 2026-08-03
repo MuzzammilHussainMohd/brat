@@ -1,7 +1,7 @@
 """Secret-shaped-value detection.
 
 Deliberately vendor-agnostic: none of these fixtures reference any real
-device. A detector that only fires on Mira-shaped data would be useless
+device. A detector that only fires on API-key-shaped data would be useless
 against the next device someone points BRAT at.
 """
 

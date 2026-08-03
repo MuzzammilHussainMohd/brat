@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:padding="12dp"
+    android:layout_marginTop="4dp"
+    android:layout_marginBottom="4dp"
+    android:background="#FFFFFF"
+    android:gravity="center_vertical">
+
+    <!-- Connection indicator -->
+    <TextView
+        android:id="@+id/deviceIndicator"
+        android:layout_width="24dp"
+        android:layout_height="24dp"
+        android:text="○"
+        android:textSize="18sp"
+        android:textColor="#CCCCCC"
+        android:gravity="center" />
+
+    <!-- Device name -->
+    <TextView
+        android:id="@+id/deviceName"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:text="Device Name"
+        android:textSize="16sp"
+        android:textColor="#333333"
+        android:paddingLeft="8dp"
+        android:paddingRight="8dp" />
+
+    <!-- Status text -->
+    <TextView
+        android:id="@+id/deviceStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Tap to connect"
+        android:textSize="12sp"
+        android:textColor="#888888" />
+
+</LinearLayout>

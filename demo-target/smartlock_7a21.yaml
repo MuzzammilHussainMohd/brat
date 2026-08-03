@@ -1,0 +1,199 @@
+# BRAT device profile - SmartLock-7A21
+#
+# The demo target: a BLE peripheral we built and own, running the firmware in
+# this repository. Everything this profile describes is reproducible - flash
+# the firmware to an nRF52840-DK and clone it yourself.
+#
+# The GATT tree below came from `brat clone`. The protocol block did not, and
+# could not: a GATT walk sees the pipe, not the frames going through it. It is
+# hand-authored from the firmware's own frame.h, which is the honest version of
+# what you would otherwise reconstruct from a session log with
+# `brat protocol infer`.
+#
+#   brat posture     --profile smartlock_7a21 --address <DK>
+#   brat impersonate --profile smartlock_7a21 --adapter hci1 --confirm
+#   brat inject      --profile smartlock_7a21 --on-cmd 0x30 ...
+
+brat_profile_version: 1
+
+device:
+  slug: smartlock_7a21
+  name: SmartLock-7A21
+  vendor: ""
+  model: 7A21
+  source: brat clone from an nRF52840-DK running demo-target firmware
+  notes: >
+    Deliberately vulnerable demonstration target. No pairing, no bonding, no
+    link encryption. The framed protocol carried over NUS authenticates
+    nothing: CMD_AUTH accepts any identifier and no later command checks
+    whether it ran. A Nordic-style buttonless DFU characteristic reboots the
+    device on an unauthenticated write.
+
+match:
+  name: SmartLock-7A21
+  service_uuids:
+    - 6e400001-b5a3-f393-e0a9-e50e24dcca9e
+
+advertising:
+  local_name: SmartLock-7A21
+  service_uuids:
+    - 6e400001-b5a3-f393-e0a9-e50e24dcca9e
+
+# What the device *should* do. Posture findings are the gap between these and
+# what it actually does - which, for this target, is everything.
+security:
+  expect_encryption: true
+  expect_pairing: true
+  expect_bonding: false
+  sensitive_characteristics:
+    - 6e400002-b5a3-f393-e0a9-e50e24dcca9e   # command ingress
+    - 6e400003-b5a3-f393-e0a9-e50e24dcca9e   # response egress
+    - 8ec90003-f315-4f60-9fb8-838830daea50   # bootloader trigger
+  observed:
+    att_mtu: 23
+    address_type: random-static
+    link_encrypted: false
+    pairing_required: false
+
+gatt:
+  services:
+    - uuid: 6e400001-b5a3-f393-e0a9-e50e24dcca9e
+      name: Nordic UART Service (NUS)
+      primary: true
+      characteristics:
+        - uuid: 6e400003-b5a3-f393-e0a9-e50e24dcca9e
+          name: NUS TX (peripheral notifies here)
+          properties: [notify]
+          notes: response egress - device to client
+          descriptors:
+            - uuid: 00002902-0000-1000-8000-00805f9b34fb
+              name: Client Characteristic Configuration
+        - uuid: 6e400002-b5a3-f393-e0a9-e50e24dcca9e
+          name: NUS RX (central writes here)
+          properties: [write, write-without-response]
+          notes: command ingress - client to device
+
+    - uuid: 0000fe59-0000-1000-8000-00805f9b34fb
+      name: Nordic Secure DFU
+      primary: true
+      characteristics:
+        - uuid: 8ec90003-f315-4f60-9fb8-838830daea50
+          name: Buttonless DFU (unbonded)
+          properties: [write, indicate]
+          notes: >
+            Writing 0x01 reboots the device with no credential of any kind.
+            On this target the reboot returns to the application rather than a
+            bootloader, so the denial of service is demonstrable without a
+            signed-image update path - to a scanner it is indistinguishable.
+          descriptors:
+            - uuid: 00002902-0000-1000-8000-00805f9b34fb
+              name: Client Characteristic Configuration
+
+# ---------------------------------------------------------------------------
+# Application-layer protocol.
+#
+#   7E 00 <dir> 10 20 <cmd> <len:u16be> <payload...> <crc16:be> EF
+#
+# CRC-16/MODBUS over everything from the start byte through the payload,
+# serialised big-endian. The length is a full 16-bit field, so its high byte
+# reads as a constant 0x00 in every capture here - easy to mistake for padding
+# until a long response arrives.
+# ---------------------------------------------------------------------------
+protocol:
+  name: smartlock-7e
+  description: >
+    Framed command protocol over NUS. No nonce, no signature, no session
+    binding - a frame with a valid CRC is accepted on its merits.
+
+  transport:
+    write_uuid: 6e400002-b5a3-f393-e0a9-e50e24dcca9e
+    notify_uuid: 6e400003-b5a3-f393-e0a9-e50e24dcca9e
+
+  frame:
+    fields:
+      - {name: start,     type: const,  value: "7E"}
+      - {name: reserved,  type: const,  value: "00"}
+      - {name: direction, type: u8,     default: 0, description: "0=request, 1=ack, 2=push"}
+      - {name: dst,       type: const,  value: "10"}
+      - {name: src,       type: const,  value: "20"}
+      - {name: cmd,       type: u8}
+      - {name: length,    type: u16be,  length_of: payload}
+      - {name: payload,   type: bytes,  length_from: length}
+      - {name: crc,       type: crc}
+      - {name: end,       type: const,  value: "EF"}
+
+  crc:
+    algorithm: crc16-modbus     # poly 0x8005 reflected (0xA001), init 0xFFFF
+    byte_order: big
+    covers: [start, reserved, direction, dst, src, cmd, length, payload]
+
+  commands:
+    0x01: PING
+    0x10: AUTH
+    0x20: LOCK_SET
+    0x30: STATUS
+    0x40: TELEMETRY
+
+  emulation:
+    variables:
+      # Firmware version the real unit reports in CMD_STATUS. A product
+      # constant, not per-unit data - but it must match what the target is
+      # actually running, or a client that compares versions will notice the
+      # impersonator.
+      firmware_version: "0201000B"
+
+    rules:
+      - name: ping
+        on_cmd: 0x01
+        respond:
+          - label: ping-ack
+            delay: 0.05
+            direction: 0x01
+            cmd: 0x01
+            payload: "01"
+
+      # Auth. The identifier arrives here and is needed by later responses, so
+      # it is captured into the session rather than reinvented - a client that
+      # sees an identifier it does not recognise discards the frame.
+      - name: auth
+        on_cmd: 0x10
+        description: accept any identifier, echo it back as authorised
+        capture:
+          uid: "{req.payload[0:8]}"
+        respond:
+          - label: auth-ack
+            delay: 0.1
+            direction: 0x01
+            cmd: 0x10
+            payload: "{req.payload[0:8]}01"
+
+      # Lock. Echoing the requested state back means an impersonated device
+      # confirms whatever the client asked for, so the client's UI shows a
+      # lock that is not the one in the room.
+      - name: lock-set
+        on_cmd: 0x20
+        respond:
+          - label: lock-ack
+            delay: 0.05
+            direction: 0x01
+            cmd: 0x20
+            payload: "{req.payload[0:1]}01"
+
+      - name: status
+        on_cmd: 0x30
+        description: report locked and authenticated, whatever the truth is
+        respond:
+          - label: status-resp
+            delay: 0.05
+            direction: 0x01
+            cmd: 0x30
+            payload: "0001{var.firmware_version}"
+
+      - name: telemetry
+        on_cmd: 0x40
+        respond:
+          - label: telemetry-resp
+            delay: 0.05
+            direction: 0x01
+            cmd: 0x40
+            payload: "5400{ts:u32be}"

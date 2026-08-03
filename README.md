@@ -1,14 +1,16 @@
 # BRAT — BLE Recon and Attack Toolkit
 
-**Clone a BLE device into a portable profile, then become it.**
+**Clone a BLE device into a portable profile, then become it — or drive it.**
 
 Most BLE security tooling plays the central: it connects to a device and asks
 it questions. BRAT does that too, but the reason it exists is the other half —
-standing your machine up *as* the device and recording what talks to it.
+standing your machine up *as* the device and recording what talks to it, or
+connecting to the real device and driving it with crafted protocol commands.
 
 ```
 brat clone --address AA:BB:CC:DD:EE:FF          # device  -> profiles/mydevice.yaml
 brat impersonate --profile mydevice --confirm   # profile -> a live rogue peripheral
+brat drive --profile mydevice -a AA:BB:.. --confirm   # send commands to the real device
 ```
 
 That round trip is the whole idea. Everything else in the toolkit supports it.
@@ -35,6 +37,7 @@ profile-driven implementation of the part nobody kept up:
 | **Advertise and serve as that device**   | no | **yes** |
 | **Decode a vendor protocol from a config file** | no | **yes** |
 | **Inject fabricated data into a client** | no | **yes** |
+| **Drive the real device with crafted commands** | no | **yes** |
 
 If you want deep central-side assessment, use a central-side tool —
 Praetorian's [Caeruleus](https://github.com/praetorian-inc/caeruleus) is
@@ -289,6 +292,40 @@ exercise. BRAT's findings are worded to that boundary and say so.
 
 ---
 
+## Driving the real device
+
+The mirror image of `impersonate`/`inject`: connect to the *real* device as an
+unauthenticated central and send it correctly framed protocol commands.
+
+```bash
+brat drive --profile mydevice -a AA:BB:CC:DD:EE:FF --confirm \
+  --send 30 --send 20:00 --send 30
+```
+
+`posture` can tell you the command characteristic is writable by anyone; `drive`
+tells you what the device does when someone writes to it. The sequence above
+sends a read-back command, a state-changing command, and the same read again —
+if the two replies differ, the device's own response proves the change came from
+an unauthenticated attacker.
+
+```
+STATE CHANGE PROVEN
+  probe:      0x30 (STATUS)
+  before:     0028 01 00 01000001
+  after:      0028 00 00 01000001
+    byte 2:   01 -> 00
+  caused by:  0x20 (ALARM_SET)
+
+CRITICAL  An unauthenticated command changed device state
+```
+
+The state-change inference requires no knowledge of what the command means. A
+device that refuses to talk without pairing produces an INFO finding instead,
+and a device that tears down the link (common when pairing fails) is reported
+as a disconnect — both are the "secure" outcome.
+
+---
+
 ## Commands
 
 | Command | Transmits | Does |
@@ -300,6 +337,7 @@ exercise. BRAT's findings are worded to that boundary and say so.
 | `brat clone` | no | Device → reusable YAML profile |
 | `brat impersonate` | **yes** | Serve a profile as a rogue peripheral |
 | `brat inject` | **yes** | Serve a profile and feed the client fabricated data |
+| `brat drive` | **yes** | Connect to a device and issue protocol commands |
 | `brat profiles` | no | List, show, and validate profiles |
 | `brat protocol` | no | Infer a frame layout from a capture, or decode against a profile |
 
@@ -312,8 +350,8 @@ sets the severity that makes the process exit non-zero, for CI use.
 ## Writing your own profile
 
 You usually don't — `brat clone` writes it. When you do, start from
-[`brat/profiles/example_wearable.yaml`](brat/profiles/example_wearable.yaml), which is a
-minimal hand-written template, and check it with:
+[`brat/profiles/example_wearable.yaml`](brat/profiles/example_wearable.yaml) (a
+minimal template) or [`brat/profiles/example_medical_device.yaml`](brat/profiles/example_medical_device.yaml) (a complete profile with a `protocol:` block), and check it with:
 
 ```bash
 brat profiles validate myprofile
@@ -354,7 +392,7 @@ brat clone --address <MAC> --protocol-from mydevice
 Profiles are searched in `$BRAT_PROFILE_PATH`, `./profiles/`,
 `~/.config/brat/profiles/`, then the ones shipped here.
 
-[`brat/profiles/mira_ultra4.yaml`](brat/profiles/mira_ultra4.yaml) is the worked example
+[`brat/profiles/example_medical_device.yaml`](brat/profiles/example_medical_device.yaml) is the worked example
 with a complete `protocol:` block, if you want to see what a finished one looks
 like.
 
@@ -362,11 +400,10 @@ like.
 
 ## Safety and scope
 
-`impersonate` and `inject` put a radio on the air pretending to be a device
-that isn't yours to speak for. They require `--confirm`, and there is no
-environment variable that bypasses it — passing the flag *is* the bypass, and
-it has to be typed. Without it you get a dry run describing exactly what would
-have happened.
+`impersonate`, `inject`, and `drive` transmit. They require `--confirm`, and
+there is no environment variable that bypasses it — passing the flag *is* the
+bypass, and it has to be typed. Without it you get a dry run describing exactly
+what would have happened.
 
 - Point BRAT only at hardware you own or have written authorisation to test.
 - A rogue peripheral will accept connections from **any** central in range,
@@ -383,12 +420,15 @@ nothing private.
 
 ### Included profiles
 
-`brat/profiles/mira_ultra4.yaml` describes a device whose weaknesses were reported
-to the vendor and to regulators, and several are fixed in current production
-firmware. It ships as a worked example of a complete profile — to demonstrate
-the *class* of flaw and what a finished `protocol:` block looks like — not as a
-working attack on shipping hardware. It contains no account identifiers,
-tokens, or measurement data from any real session, and none should be added.
+The example profiles in `brat/profiles/` demonstrate different use cases:
+
+- `example_wearable.yaml` — minimal template, no protocol block
+- `example_nus_device.yaml` — Nordic UART Service device
+- `example_medical_device.yaml` — complete profile with a `protocol:` block, emulation rules, and variables
+
+These are fictional devices meant to illustrate what a finished profile looks
+like. They contain no account identifiers, tokens, or measurement data from any
+real session.
 
 ---
 
@@ -399,7 +439,7 @@ pip install -e '.[all]'
 pytest -q
 ```
 
-260 tests, no hardware required. Most of the peripheral suite runs against a
+300+ tests, no hardware required. Most of the peripheral suite runs against a
 stubbed bless server, but `tests/test_peripheral_realbless.py` drives the *real*
 one with only D-Bus faked underneath — which is what catches the things a stub
 cannot, since a fake server never performs bless's own flag conversion or builds

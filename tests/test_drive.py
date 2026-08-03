@@ -11,9 +11,19 @@ import argparse
 
 import pytest
 
-from brat.commands.drive import Step, diff_bytes, find_state_changes, parse_steps
+from brat.commands.drive import (
+    Step,
+    _add_findings,
+    _stalled,
+    diff_bytes,
+    find_state_changes,
+    parse_steps,
+)
+from brat.core.ble import GattResult
+from brat.core.findings import Confidence, Severity
 from brat.core.profile import load_profile
 from brat.core.protocol import ProtocolEngine
+from brat.core.report import Report
 
 
 @pytest.fixture
@@ -174,3 +184,91 @@ def test_a_single_probe_reading_cannot_show_a_change(engine):
     steps = [_step(0x20, b"\x00\x01", b"\x00"), _step(0x30, b"\x00\x28\x00\x01")]
 
     assert find_state_changes(steps, engine) == []
+
+
+# -- refusal vs stall -------------------------------------------------------
+
+
+def _findings_for(steps, engine, listening=True):
+    report = Report(command="drive", target="AA:BB:CC:DD:EE:FF")
+    refused = [
+        s for s in steps
+        if s.write_result is not None and s.write_result.is_security_refusal
+    ]
+    stalled = [s for s in steps if _stalled(s.write_result)]
+    _add_findings(
+        report, "AA:BB:CC:DD:EE:FF", engine,
+        steps, find_state_changes(steps, engine),
+        refused, stalled, paired_before=False, listening=listening,
+    )
+    return report
+
+
+def test_a_stall_counts_as_enforcement_not_silence(engine):
+    """Regression: a secure device must produce a verdict, not a hang.
+
+    v2 of the demo target does not answer an unpaired write with an ATT error -
+    BlueZ starts pairing on its behalf and the call never returns. Before the
+    operation deadline existed this hung the tool forever; the device that
+    behaves best looked like a broken run.
+    """
+    step = Step(cmd=0x20, payload=b"\x00", label="20:00")
+    step.write_result = GattResult.TIMEOUT
+
+    report = _findings_for([step], engine)
+    checks = [f.check for f in report.findings]
+
+    assert "protocol.commands-refused" in checks
+    assert "protocol.unauthenticated-command-accepted" not in checks
+
+
+def test_a_stall_is_inferred_and_an_att_error_is_confirmed(engine):
+    """A hang is strong evidence; only an ATT error is proof."""
+    stalling = Step(cmd=0x20, payload=b"\x00", label="20:00")
+    stalling.write_result = GattResult.TIMEOUT
+    refusing = Step(cmd=0x20, payload=b"\x00", label="20:00")
+    refusing.write_result = GattResult.AUTHENTICATION_REQUIRED
+
+    by_stall = _findings_for([stalling], engine).findings
+    by_error = _findings_for([refusing], engine).findings
+
+    assert next(iter(by_stall)).confidence is Confidence.INFERRED
+    assert next(iter(by_error)).confidence is Confidence.CONFIRMED
+
+
+def test_disconnect_also_counts_as_a_stall():
+    """A peripheral may tear the link down instead of erroring or hanging."""
+    assert _stalled(GattResult.DISCONNECTED)
+    assert _stalled(GattResult.TIMEOUT)
+    assert not _stalled(GattResult.SUCCESS)
+    assert not _stalled(GattResult.NOT_PERMITTED)
+
+
+def test_an_answered_command_outranks_a_stall(engine):
+    """One accepted command means the device is not enforcing, whatever else stalled."""
+    ok = _step(0x30, b"\x00\x28")
+    ok.write_result = GattResult.SUCCESS
+    dead = Step(cmd=0x40, payload=b"", label="40")
+    dead.write_result = GattResult.TIMEOUT
+
+    checks = [f.check for f in _findings_for([ok, dead], engine).findings]
+
+    assert "protocol.unauthenticated-command-accepted" in checks
+    assert "protocol.commands-refused" not in checks
+
+
+def test_a_proven_state_change_is_critical(engine):
+    steps = [
+        _step(0x30, b"\x00\x28\x01\x01"),
+        _step(0x20, b"\x00\x01", b"\x00"),
+        _step(0x30, b"\x00\x28\x00\x01"),
+    ]
+    for s in steps:
+        s.write_result = GattResult.SUCCESS
+
+    findings = list(_findings_for(steps, engine).findings)
+    critical = [f for f in findings if f.severity is Severity.CRITICAL]
+
+    assert len(critical) == 1
+    assert critical[0].check == "protocol.unauthenticated-state-change"
+    assert "byte 2 01->00" in critical[0].description

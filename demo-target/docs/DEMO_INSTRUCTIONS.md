@@ -398,16 +398,33 @@ sudo python3 -m brat drive --profile glucosense_open --adapter hci0 \
     --address <v2-MAC> --send 30 --send 20:00 --send 30 --wait 1.5 --confirm
 ```
 
-**Audience sees**: every write refused at the ATT layer, and an INFO finding
-instead of a CRITICAL:
+**Audience sees** an INFO finding where v1 gave a CRITICAL:
 
 ```
-INFO  Device refused protocol commands from an unauthenticated peer
-      protocol.commands-refused
+RESULT
+  commands sent:           3
+  answered:                0
+  device closed the link:  3
+
+  CMD   NAME       WRITE
+  0x30  STATUS     disconnected
+  0x20  ALARM_SET  disconnected
+  0x30  STATUS     disconnected
+
+INFO  Device refused protocol commands from an unauthenticated peer  (inferred)
 ```
 
 **And LED1 stays lit.** The alarm cannot be silenced by anyone who has not
 bonded with a passkey.
+
+Note *how* it refuses, because it is worth explaining: v2 does not send back an
+"insufficient authentication" error. It **drops the connection**. BlueZ starts
+pairing on the device's behalf, cannot finish without the passkey, and the
+device hangs up. BRAT reports this as `inferred` rather than `confirmed` — an
+out-of-range device would look identical from the radio's point of view, and
+the tool says so rather than overclaiming.
+
+> "Takes about ten seconds and ends with the device hanging up on me."
 
 > "Same command. Same tool. Same three frames. The device now says no."
 

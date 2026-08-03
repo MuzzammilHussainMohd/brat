@@ -289,6 +289,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_drv.add_argument(
         "--gap", type=float, default=0.0, help="pause between commands (default: 0)"
     )
+    p_drv.add_argument(
+        "--op-timeout",
+        type=float,
+        default=10.0,
+        help="give up on a single GATT operation after this long (default: 10). "
+        "A device demanding pairing makes BlueZ hang rather than return an error, "
+        "so this is what turns 'secure device' into a result instead of a hang.",
+    )
     p_drv.add_argument("--session-log", help="write the full exchange to this JSON file")
     p_drv.add_argument(
         "--confirm", action="store_true", help="required: acknowledge that this transmits"

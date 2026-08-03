@@ -85,6 +85,12 @@ Verified on v1: silences the alarm (`byte 2: 01 -> 00`) while glucose stays at
 0x0028 = 40 mg/dL, with the device's own `authenticated` byte reading `00`
 throughout. LED1 physically goes out. `--send 20:01` reverses it.
 
+Verified on v2: all three commands come back `disconnected` — v2 refuses by
+**closing the link**, not by returning an ATT error (BlueZ starts pairing, can't
+finish without the passkey, device hangs up). Reported INFO/inferred, LED1 stays
+lit. Every GATT op in `drive` is bounded by `--op-timeout` (default 10s) because
+a device demanding pairing otherwise hangs the call forever.
+
 Profile: `profiles/glucosense_open.yaml` (5 emulation rules, full protocol block)
 
 ### Known traps

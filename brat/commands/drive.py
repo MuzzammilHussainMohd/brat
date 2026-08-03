@@ -50,6 +50,21 @@ from ..core.profile import load_profile
 from ..core.protocol import Frame, ProtocolEngine, as_int, parse_hex
 from ..core.report import Report
 
+# A peripheral that requires bonding does not necessarily answer an unpaired
+# operation with an ATT error. Against BlueZ the usual outcome is that the host
+# starts pairing on the peripheral's behalf, cannot finish it without a
+# passkey, and the call simply never returns - the connection stays up and the
+# operation hangs indefinitely. Every BlueZ call here is therefore bounded, or
+# a correctly-secured device would hang the tool instead of being reported as
+# secure. `posture` treats the same stall as enforcement evidence for the same
+# reason; see `_reads_stalled_on_a_live_link` there.
+_OP_DEADLINE = 10.0
+
+
+def _stalled(result: GattResult | None) -> bool:
+    """Whether an operation neither succeeded nor gave a reason for failing."""
+    return result in (GattResult.TIMEOUT, GattResult.DISCONNECTED)
+
 
 @dataclass
 class Step:
@@ -228,15 +243,37 @@ async def run_sequence(
     wait: float,
     gap: float,
     quiet: bool,
-) -> None:
-    """Write each frame in turn, collecting whatever the device notifies back."""
+    op_timeout: float = _OP_DEADLINE,
+) -> bool:
+    """Write each frame in turn, collecting whatever the device notifies back.
+
+    Returns whether the notify subscription was established. A device that
+    demands encryption will stall it, which is a result rather than an error:
+    the sequence still runs so the writes get their own verdicts.
+    """
     inbox: list[bytes] = []
+    listening = False
 
     def on_notify(_char, data: bytearray) -> None:
         inbox.append(bytes(data))
 
     if engine.notify_uuid:
-        await client.start_notify(engine.notify_uuid, on_notify)
+        try:
+            await asyncio.wait_for(
+                client.start_notify(engine.notify_uuid, on_notify), timeout=op_timeout
+            )
+            listening = True
+        except (TimeoutError, asyncio.TimeoutError):
+            if not quiet:
+                console.warn(
+                    f"subscribing to {engine.notify_uuid} stalled after {op_timeout:g}s "
+                    "- the device is most likely demanding pairing to enable "
+                    "notifications."
+                )
+        except Exception as exc:  # noqa: BLE001
+            result, detail = ble.classify_error(exc)
+            if not quiet:
+                console.warn(f"could not subscribe for replies: {result.value}: {detail}")
     elif not quiet:
         console.warn(
             "profile declares no protocol.transport.notify_uuid, so replies cannot be "
@@ -244,6 +281,25 @@ async def run_sequence(
         )
 
     for index, step in enumerate(steps):
+        # A peripheral that refuses an unauthenticated operation may answer by
+        # dropping the link rather than returning an ATT error - failed pairing
+        # tears the connection down. Once that has happened every later call
+        # fails for a reason that describes our dead client rather than the
+        # device ("Service Discovery has not been performed yet"), which is how
+        # a device enforcing correctly ends up reported as an unknown error.
+        # Check liveness first so the disconnect is recorded as what it is.
+        if not client.is_connected:
+            step.write_result = GattResult.DISCONNECTED
+            step.write_detail = "link was already down before this command was sent"
+            if not quiet:
+                console.write()
+                console.warn(
+                    f"[{index + 1}/{len(steps)}] skipped - the device closed the "
+                    "connection, which is how a peripheral demanding pairing "
+                    "commonly refuses."
+                )
+            continue
+
         frame = engine.codec.build(
             {
                 engine.codec.command_field: step.cmd,
@@ -263,17 +319,34 @@ async def run_sequence(
             console.kv("write", frame.hex(), 6)
 
         try:
-            await client.write_gatt_char(engine.write_uuid, frame, response=True)
+            await asyncio.wait_for(
+                client.write_gatt_char(engine.write_uuid, frame, response=True),
+                timeout=op_timeout,
+            )
             step.write_result = GattResult.SUCCESS
+        except (TimeoutError, asyncio.TimeoutError):
+            step.write_result = GattResult.TIMEOUT
+            step.write_detail = (
+                f"no response within {op_timeout:g}s on a live connection"
+            )
+            if not quiet:
+                console.kv("stalled", step.write_detail, 6)
+            continue
         except Exception as exc:  # noqa: BLE001
             step.write_result, step.write_detail = ble.classify_error(exc)
+            # bleak reports operations on a torn-down client as its own internal
+            # state problem. Ask the link, not the message: if it is down, the
+            # device disconnected us, and that is the finding.
+            if not client.is_connected:
+                step.write_result = GattResult.DISCONNECTED
+                step.write_detail = f"device closed the connection ({step.write_detail})"
             if not quiet:
                 console.kv("refused", f"{step.write_result.value}: {step.write_detail}", 6)
             # A security refusal is the device doing its job; keep going so the
             # rest of the sequence still runs and the report covers all of it.
             continue
 
-        if engine.notify_uuid:
+        if listening:
             await asyncio.sleep(wait)
 
         step.replies = list(inbox)
@@ -294,11 +367,15 @@ async def run_sequence(
         if gap and index < len(steps) - 1:
             await asyncio.sleep(gap)
 
-    if engine.notify_uuid:
+    if listening:
         try:
-            await client.stop_notify(engine.notify_uuid)
+            await asyncio.wait_for(
+                client.stop_notify(engine.notify_uuid), timeout=op_timeout
+            )
         except Exception:  # noqa: BLE001, S110
             pass  # the link may already be gone; nothing here depends on it
+
+    return listening
 
 
 async def execute(args, console: Console) -> Report:
@@ -371,8 +448,15 @@ async def execute(args, console: Console) -> Report:
             console.write()
             console.rule("SEQUENCE")
 
-        await run_sequence(
-            client, engine, steps, console, wait=args.wait, gap=args.gap, quiet=quiet
+        listening = await run_sequence(
+            client,
+            engine,
+            steps,
+            console,
+            wait=args.wait,
+            gap=args.gap,
+            quiet=quiet,
+            op_timeout=args.op_timeout,
         )
 
     changes = find_state_changes(steps, engine)
@@ -382,6 +466,8 @@ async def execute(args, console: Console) -> Report:
         s for s in steps
         if s.write_result is not None and s.write_result.is_security_refusal
     ]
+    stalled = [s for s in steps if _stalled(s.write_result)]
+    dropped = [s for s in steps if s.write_result is GattResult.DISCONNECTED]
 
     report.data = {
         "confirmed": True,
@@ -390,14 +476,20 @@ async def execute(args, console: Console) -> Report:
         "connected": True,
         "paired_before": paired_before,
         "protocol": engine.name,
+        "subscribed_for_replies": listening,
         "commands_sent": len(steps),
         "commands_answered": len(answered),
         "commands_refused": len(refused),
+        "commands_stalled": len(stalled) - len(dropped),
+        "commands_dropped": len(dropped),
         "state_changes": changes,
         "steps": [s.to_dict(engine) for s in steps],
     }
 
-    _add_findings(report, args.address, engine, steps, changes, refused, paired_before)
+    _add_findings(
+        report, args.address, engine, steps, changes, refused, stalled,
+        paired_before, listening,
+    )
 
     if args.session_log:
         path = Path(args.session_log)
@@ -418,7 +510,9 @@ def _add_findings(
     steps: list[Step],
     changes: list[dict],
     refused: list[Step],
+    stalled: list[Step],
     paired_before: bool,
+    listening: bool,
 ) -> None:
     answered = [s for s in steps if s.answered]
 
@@ -430,31 +524,84 @@ def _add_findings(
             "attacker can do."
         )
 
-    if refused and not answered:
+    if (refused or stalled) and not answered:
+        # An explicit ATT security error is proof. A stall is not - it is the
+        # signature of BlueZ starting pairing on the peripheral's behalf and
+        # being unable to finish it, which is what a device demanding a passkey
+        # looks like from here, but it is also what an unresponsive device
+        # looks like. Say which one this was rather than flattening both into
+        # the same confidence.
+        blocked = refused + stalled
+        timed_out = [s for s in stalled if s.write_result is GattResult.TIMEOUT]
+        dropped = [s for s in stalled if s.write_result is GattResult.DISCONNECTED]
         report.findings.add(
             Finding(
                 check="protocol.commands-refused",
                 title="Device refused protocol commands from an unauthenticated peer",
                 severity=Severity.INFO,
                 target=address,
-                confidence=Confidence.CONFIRMED,
+                confidence=Confidence.CONFIRMED if refused else Confidence.INFERRED,
                 description=(
-                    f"All {len(refused)} command write(s) were refused at the ATT layer "
-                    "with a security error. The device requires an authenticated or "
-                    "encrypted link before it will accept application-layer commands, "
-                    "which is the behaviour you want."
+                    f"None of the {len(steps)} command(s) sent were accepted. "
+                    + (
+                        f"{len(refused)} were refused at the ATT layer with an explicit "
+                        "security error. "
+                        if refused
+                        else ""
+                    )
+                    + (
+                        f"{len(dropped)} could not be sent because the device closed the "
+                        "connection. Tearing down the link is how a peripheral that "
+                        "requires bonding commonly refuses an unauthenticated peer: "
+                        "BlueZ begins pairing on the device's behalf, cannot finish it "
+                        "without a passkey, and the device drops the connection rather "
+                        "than answering. "
+                        if dropped
+                        else ""
+                    )
+                    + (
+                        f"{len(timed_out)} never completed on a connection that stayed "
+                        "up, which is the same refusal seen as a stall rather than a "
+                        "disconnect. "
+                        if timed_out
+                        else ""
+                    )
+                    + (
+                        "That is strong but indirect evidence - an unresponsive or "
+                        "out-of-range device looks the same from here. "
+                        if not refused
+                        else ""
+                    )
+                    + "The device requires an authenticated or encrypted link before it "
+                    "will accept application-layer commands, which is the behaviour you "
+                    "want."
                 ),
                 evidence={
-                    "refusals": [
+                    "blocked": [
                         {
                             "cmd": f"0x{s.cmd:02X}",
+                            "cmd_name": engine.command_name(s.cmd),
                             "result": s.write_result.value if s.write_result else None,
+                            "detail": s.write_detail or None,
                         }
-                        for s in refused
-                    ]
+                        for s in blocked
+                    ],
+                    "explicit_att_refusals": len(refused),
+                    "device_closed_connection": len(dropped),
+                    "stalled_on_live_link": len(timed_out),
+                    "subscribed_for_replies": listening,
                 },
             )
         )
+        if stalled and not refused:
+            observed = "a disconnect" if dropped else "a stall"
+            report.note(
+                f"The refusal was observed as {observed} rather than an ATT error code. "
+                "To see the device's own reason, watch the exchange with "
+                f"`btmon` while this runs, or pair first (`bluetoothctl` -> "
+                "`pair <addr>`) and re-run to confirm the same commands succeed once "
+                "bonded."
+            )
         return
 
     # The strong result: the device's own read-back changed after a command we
@@ -531,11 +678,23 @@ def _add_findings(
             )
         )
 
-    if not answered and not refused:
+    accepted = [s for s in steps if s.write_result is GattResult.SUCCESS]
+    if not answered and accepted:
+        # Only claim the writes landed for the ones that actually returned
+        # success. Saying "the writes were accepted" about a run where every
+        # write errored inverts the result of the test.
         report.note(
-            "Every command was written successfully but nothing came back. The device "
-            "may not use the notify characteristic this profile declares, or may need "
-            "a longer --wait. The writes themselves were accepted."
+            f"{len(accepted)} of {len(steps)} command(s) were written successfully but "
+            "nothing came back"
+            + ("" if listening else " (no notify subscription was established)")
+            + ". The device may not reply on the notify characteristic this profile "
+            "declares, or may need a longer --wait."
+        )
+    elif not answered and not accepted and not refused and not stalled:
+        report.note(
+            "No command was accepted, and none failed for a reason that indicates the "
+            "device refused it. Check that the write characteristic in the profile's "
+            "protocol.transport block is the one this device actually uses."
         )
 
     report.note(
@@ -560,6 +719,10 @@ def render(report: Report, console: Console) -> None:
     console.kv("answered", data["commands_answered"])
     if data["commands_refused"]:
         console.kv("refused (security)", data["commands_refused"])
+    if data.get("commands_stalled"):
+        console.kv("stalled on live link", data["commands_stalled"])
+    if data.get("commands_dropped"):
+        console.kv("device closed the link", data["commands_dropped"])
 
     rows = []
     for step in data["steps"]:

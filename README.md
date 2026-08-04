@@ -57,20 +57,49 @@ need to be the peripheral. They compose well.
 ### Install
 
 ```bash
-# Clone and install
+# Clone the repo
 git clone https://github.com/MuzzammilHussainMohd/brat.git
 cd brat
-pip install -e '.[peripheral]'
 
-# Verify your environment
-brat doctor
+# Run the installer
+./install.sh
 ```
 
-That's it. If `brat doctor` shows green, you're ready.
+That's it. The installer creates a virtual environment and installs everything.
+
+**Manual install** (if you prefer):
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -e '.[peripheral]'
+```
 
 **Minimal install** (recon only, no peripheral mode):
 ```bash
 pip install -e .
+```
+
+### Running BRAT
+
+After installation, always activate the virtual environment first:
+
+```bash
+source venv/bin/activate
+```
+
+Then run commands:
+
+```bash
+brat doctor                              # Check your setup
+sudo brat scan                           # Find nearby BLE devices  
+sudo brat posture -a AA:BB:CC:DD:EE:FF   # Security check a device
+brat clone -a AA:BB:CC:DD:EE:FF          # Clone a device to a profile
+sudo brat impersonate -p mydevice --confirm  # Become the device
+```
+
+When done:
+```bash
+deactivate
 ```
 
 ### First scan

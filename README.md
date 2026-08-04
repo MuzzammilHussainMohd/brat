@@ -46,35 +46,41 @@ need to be the peripheral. They compose well.
 
 ---
 
-## Install
+## Quick Start
 
-Linux with BlueZ. Peripheral mode needs an adapter that supports LE
-advertising, which BRAT will verify for you.
+### Requirements
+
+- **Linux** with BlueZ (tested on Ubuntu 20.04+, Debian, Kali)
+- **Python 3.9+**
+- **Bluetooth adapter** — any USB dongle works for scanning/posture; peripheral mode needs one that supports LE advertising (Intel, Realtek, CSR — most do)
+
+### Install
 
 ```bash
-git clone https://github.com/<you>/brat && cd brat
+# Clone and install
+git clone https://github.com/MuzzammilHussainMohd/brat.git
+cd brat
 pip install -e '.[peripheral]'
 
-brat doctor          # check adapter, BlueZ, and peripheral-mode readiness first
+# Verify your environment
+brat doctor
 ```
 
-**On adapters.** For `impersonate` and `inject`, use an ordinary USB Bluetooth
-dongle — Intel, Realtek, CSR. `brat doctor` reads the controller's own BD
-address rather than trusting BlueZ's, because BlueZ invents a static random
-address when the controller has none and will otherwise report a radio that
-cannot advertise at all as perfectly healthy. It also names the nRF52840
-running Zephyr's `hci_usb` firmware as unsupported for peripheral mode: it
-presents a working-looking HCI interface but boots with no address and
-exhausts its own advertising resources across sessions, in a way restarting
-`bluetoothd` cannot clear. Keep that dongle for sniffing.
+That's it. If `brat doctor` shows green, you're ready.
 
-One sharp edge worth knowing: bless looks for an adapter whose name *contains*
-`hci0` and fails outright otherwise, so if your adapter came up as `hci1` you
-need `--adapter hci1`. `brat doctor` tells you when that applies.
+**Minimal install** (recon only, no peripheral mode):
+```bash
+pip install -e .
+```
 
-`bleak` and `PyYAML` are the only hard dependencies. `bless` is optional and
-only needed for `impersonate` / `inject`, so recon works on machines that
-cannot act as a peripheral.
+### First scan
+
+```bash
+sudo brat scan
+```
+
+You'll see every BLE device advertising nearby, with address type classification
+and profile fingerprinting if a match exists.
 
 ---
 
@@ -90,8 +96,8 @@ $ brat scan
 DEVICES (4)
 
   ADDRESS            NAME            RSSI  ADDR TYPE      SVCS  PROFILE
-  D4:8A:39:11:22:33  Mira-Analyzer   -48   random-static  1     mira_ultra4 +proto
-  C8:1B:2E:00:11:22  Example-Band    -71   resolvable...  2     -
+  D4:8A:39:11:22:33  MyDevice        -48   random-static  1     example_nus_device +proto
+  C8:1B:2E:00:11:22  Fitness-Band    -71   resolvable...  2     -
 ```
 
 Every result is scored against every known profile, so the output names the
@@ -142,10 +148,10 @@ No hand-authoring:
 
 ```yaml
 device:
-  slug: mira_analyzer
-  name: Mira-Analyzer
+  slug: my_device
+  name: MyDevice
 match:
-  name: Mira-Analyzer
+  name: MyDevice
   service_uuids: [6e400001-b5a3-f393-e0a9-e50e24dcca9e]
 gatt:
   services:
@@ -163,14 +169,14 @@ structure-only clone.
 ### 4. Become it
 
 ```bash
-$ brat impersonate --profile mira_analyzer --confirm
+$ brat impersonate --profile my_device --confirm
 ```
 
 Your machine now advertises that name and serves that GATT tree. Point the real
 client at it and read what it sends:
 
 ```
-[+] Advertising as 'Mira-Analyzer'. Waiting for a central to connect.
+[+] Advertising as 'MyDevice'. Waiting for a central to connect.
 
 [+] Central connected (inferred from first GATT operation at 14:22:07.118)
 
@@ -423,12 +429,43 @@ nothing private.
 The example profiles in `brat/profiles/` demonstrate different use cases:
 
 - `example_wearable.yaml` — minimal template, no protocol block
-- `example_nus_device.yaml` — Nordic UART Service device
-- `example_medical_device.yaml` — complete profile with a `protocol:` block, emulation rules, and variables
+- `example_nus_device.yaml` — Nordic UART Service device with full protocol
+- `example_medical_device.yaml` — complete profile with emulation rules and variables
 
-These are fictional devices meant to illustrate what a finished profile looks
-like. They contain no account identifiers, tokens, or measurement data from any
-real session.
+These are synthetic examples meant to illustrate what a finished profile looks
+like. They contain no data from any real device or session.
+
+---
+
+## Troubleshooting
+
+### `brat doctor` fails
+
+```bash
+# Make sure BlueZ is running
+sudo systemctl start bluetooth
+
+# Check adapter is recognized
+hciconfig -a
+
+# If adapter shows DOWN:
+sudo hciconfig hci0 up
+```
+
+### Permission denied
+
+Most commands need root for raw HCI access:
+```bash
+sudo brat scan
+sudo brat posture --address AA:BB:CC:DD:EE:FF
+```
+
+### Adapter shows as hci1 instead of hci0
+
+Pass `--adapter hci1` to any command:
+```bash
+sudo brat scan --adapter hci1
+```
 
 ---
 
@@ -456,6 +493,15 @@ Contributions welcome, especially:
 - **Checksum algorithms** and frame field types the codec doesn't cover yet.
 - **Posture checks.** They are small independent functions in
   `brat/commands/posture.py`; adding one is a local change.
+
+---
+
+## Authors
+
+- Muzzammil Hussain Mohd
+- Narmina Karimova
+- Gigi Lau
+- Luces
 
 ## License
 

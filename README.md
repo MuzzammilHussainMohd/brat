@@ -91,7 +91,7 @@ Then run commands:
 
 ```bash
 brat doctor                              # Check your setup
-sudo brat scan                           # Find nearby BLE devices  
+sudo brat scan                           # Find nearby BLE devices
 sudo brat posture -a AA:BB:CC:DD:EE:FF   # Security check a device
 brat clone -a AA:BB:CC:DD:EE:FF          # Clone a device to a profile
 sudo brat impersonate -p mydevice --confirm  # Become the device
@@ -529,9 +529,9 @@ Contributions welcome, especially:
 
 - Muzzammil Hussain Mohd
 - Narmina Karimova
-- Gigi Lau
-- Luces
+- Gigi Xiaoqing Liu
+- Lucas En Mong
 
 ## License
 
-Apache 2.0.
+[Apache 2.0](LICENSE).

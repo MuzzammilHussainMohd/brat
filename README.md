@@ -1,5 +1,9 @@
 # BRAT — BLE Recon and Attack Toolkit
 
+![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
+![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)
+![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)
+
 **Clone a BLE device into a portable profile, then become it — or drive it.**
 
 Most BLE security tooling plays the central: it connects to a device and asks

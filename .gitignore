@@ -19,6 +19,9 @@ profiles/local_*.yaml
 # Local development artifacts (not published)
 local/
 .claude/
+profiles/
+session.json
+*.cast
 
 # IDE
 .vscode/
